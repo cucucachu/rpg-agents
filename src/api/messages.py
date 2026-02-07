@@ -24,9 +24,14 @@ from bson import ObjectId
 from ..db import get_db
 from ..models import Message, User
 from .auth import get_current_user, get_current_user_optional
+from .broadcast import get_broadcaster
+from langchain_core.messages import ToolMessage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/worlds", tags=["messages"])
+
+# Static message for users without a character - referenced in GM prompt
+NEW_PLAYER_MESSAGE = "NEW_PLAYER_JOINING: I am a new player joining this world. Please help me create a character."
 
 # ============================================================================
 # Per-World Lock Management
@@ -34,6 +39,7 @@ router = APIRouter(prefix="/worlds", tags=["messages"])
 
 _world_locks: dict[str, asyncio.Lock] = {}
 _world_processing: dict[str, bool] = {}  # Track if world is currently processing
+_world_lock_holder: dict[str, dict] = {}  # Track who holds the lock {user_id, character_name}
 
 
 def get_world_lock(world_id: str) -> asyncio.Lock:
@@ -47,6 +53,13 @@ def get_world_lock(world_id: str) -> asyncio.Lock:
 def is_world_processing(world_id: str) -> bool:
     """Check if a world is currently processing a message."""
     return _world_processing.get(world_id, False)
+
+
+def get_world_lock_holder(world_id: str) -> dict | None:
+    """Get info about who holds the lock for a world."""
+    if is_world_processing(world_id):
+        return _world_lock_holder.get(world_id)
+    return None
 
 
 # ============================================================================
@@ -64,6 +77,7 @@ class MessageResponse(BaseModel):
     world_id: str
     user_id: str | None
     character_name: str
+    display_name: str | None  # User's display name (for player messages)
     content: str
     message_type: str
     created_at: str
@@ -141,7 +155,36 @@ async def get_user_character_name(db, user_id: str, world_id: str) -> str:
     return "Player"
 
 
-async def run_agent(world_id: str, user_message: str, character_name: str, db) -> str:
+class AgentResult:
+    """Result from running the GM agent."""
+    def __init__(self, response_text: str, created_character_ids: list[str]):
+        self.response_text = response_text
+        self.created_character_ids = created_character_ids
+
+
+def extract_created_character_ids(messages: list) -> list[str]:
+    """Extract character IDs from create_character tool results."""
+    character_ids = []
+    
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and msg.name == "create_character":
+            # Tool result format: "Created character: {json}"
+            content = msg.content
+            if content and "Created character:" in content:
+                try:
+                    # Extract JSON part after "Created character: "
+                    json_str = content.split("Created character: ", 1)[1]
+                    char_data = json.loads(json_str)
+                    if char_data.get("id") and char_data.get("is_player_character"):
+                        character_ids.append(char_data["id"])
+                        logger.info(f"Found created PC: {char_data['id']} ({char_data.get('name', 'unknown')})")
+                except (json.JSONDecodeError, IndexError, KeyError) as e:
+                    logger.warning(f"Failed to parse create_character result: {e}")
+    
+    return character_ids
+
+
+async def run_agent(world_id: str, user_message: str, character_name: str, db) -> AgentResult:
     """Run the GM agent and return the response.
     
     The agent graph now handles context loading deterministically:
@@ -155,6 +198,9 @@ async def run_agent(world_id: str, user_message: str, character_name: str, db) -
     
     Agent activity is logged to the agent_activity collection and can be
     streamed via the /activity/stream endpoint.
+    
+    Returns:
+        AgentResult with response_text and list of created player character IDs
     """
     global _gm_agent
     
@@ -169,7 +215,7 @@ async def run_agent(world_id: str, user_message: str, character_name: str, db) -
     recent_messages = await get_recent_messages(db, world_id, limit=20)
     
     # Format the new message with character context
-    formatted_message = f"[{character_name}]: {user_message}"
+    formatted_message = f"**Submitted by {character_name}**\n\n{user_message}"
     
     # Run agent graph (load_context -> gm_agent -> capture_response -> scribe -> cleanup)
     # The gm_final_response is captured before scribe runs
@@ -184,13 +230,19 @@ async def run_agent(world_id: str, user_message: str, character_name: str, db) -
         # Keep track of the final state
         final_state = event
     
+    # Extract created character IDs from tool messages
+    created_character_ids = []
+    
     # Get the GM's response from the captured state field
     if final_state:
         response_text = final_state.get("gm_final_response", "")
         
+        # Extract any created player characters from tool results
+        messages = final_state.get("messages", [])
+        created_character_ids = extract_created_character_ids(messages)
+        
         # Fallback: if gm_final_response wasn't captured, try to find it in messages
         if not response_text:
-            messages = final_state.get("messages", [])
             for msg in reversed(messages):
                 if hasattr(msg, "content") and msg.content:
                     if not (hasattr(msg, "tool_calls") and msg.tool_calls):
@@ -200,7 +252,7 @@ async def run_agent(world_id: str, user_message: str, character_name: str, db) -
                             response_text = content
                             break
     
-    return response_text
+    return AgentResult(response_text=response_text, created_character_ids=created_character_ids)
 
 
 # ============================================================================
@@ -258,12 +310,36 @@ async def send_message(
         
         async with lock:
             _world_processing[world_id] = True
+            broadcaster = get_broadcaster()
             
             try:
+                # Check if user has a character assigned
+                has_character = bool(access.get("character_id"))
+                
                 # Get character name for this user
                 character_name = await get_user_character_name(db, user_id, world_id)
                 
-                # Save user message
+                # Determine the message to send to the agent
+                # If user has no character, substitute with the new player message
+                if has_character:
+                    agent_message = request.content
+                else:
+                    agent_message = NEW_PLAYER_MESSAGE
+                    logger.info(f"User {user_id} has no character in world {world_id}, triggering character creation flow")
+                
+                # Track who holds the lock and broadcast processing started
+                _world_lock_holder[world_id] = {
+                    "user_id": user_id,
+                    "character_name": character_name,
+                }
+                await broadcaster.broadcast(world_id, {
+                    "type": "processing_started",
+                    "locked_by": user_id,
+                    "character_name": character_name,
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+                
+                # Save user message (save the ORIGINAL content, not the substituted message)
                 user_msg = Message(
                     world_id=world_id,
                     user_id=user_id,
@@ -276,14 +352,38 @@ async def send_message(
                 
                 logger.info(f"Saved user message {user_msg.id} in world {world_id}")
                 
-                # Run the agent
+                # Run the agent (with substituted message if no character)
                 try:
-                    gm_response = await run_agent(
+                    agent_result = await run_agent(
                         world_id=world_id,
-                        user_message=request.content,
+                        user_message=agent_message,
                         character_name=character_name,
                         db=db,
                     )
+                    gm_response = agent_result.response_text
+                    
+                    # If user had no character and one was created, link them
+                    if not has_character and agent_result.created_character_ids:
+                        # Link the first created PC to this user
+                        new_char_id = agent_result.created_character_ids[0]
+                        await db.world_access.update_one(
+                            {"user_id": user_id, "world_id": world_id},
+                            {"$set": {"character_id": new_char_id}}
+                        )
+                        logger.info(f"Linked user {user_id} to character {new_char_id} in world {world_id}")
+                        
+                        # Update character_name for the response (it was "Player" or display_name before)
+                        char_doc = await db.characters.find_one({"_id": ObjectId(new_char_id)})
+                        if char_doc:
+                            character_name = char_doc.get("name", character_name)
+                            # Update the user message we already saved with the correct character name
+                            await db.messages.update_one(
+                                {"_id": ObjectId(user_msg.id)},
+                                {"$set": {"character_name": character_name}}
+                            )
+                            user_msg.character_name = character_name
+                            logger.info(f"Updated message {user_msg.id} with character name: {character_name}")
+                            
                 except Exception as e:
                     logger.error(f"Agent error: {e}")
                     gm_response = f"[The GM encounters a moment of confusion...] (Error: {str(e)[:100]})"
@@ -301,12 +401,21 @@ async def send_message(
                 
                 logger.info(f"Saved GM message {gm_msg.id} in world {world_id}")
                 
+                # Broadcast processing complete with timestamps for refresh
+                now = datetime.utcnow().isoformat()
+                await broadcaster.broadcast(world_id, {
+                    "type": "processing_complete",
+                    "messages_updated_at": now,
+                    "events_updated_at": now,
+                })
+                
                 return SendMessageResponse(
                     user_message=MessageResponse(
                         id=user_msg.id,
                         world_id=user_msg.world_id,
                         user_id=user_msg.user_id,
                         character_name=user_msg.character_name,
+                        display_name=current_user.display_name,
                         content=user_msg.content,
                         message_type=user_msg.message_type,
                         created_at=user_msg.created_at.isoformat(),
@@ -316,6 +425,7 @@ async def send_message(
                         world_id=gm_msg.world_id,
                         user_id=gm_msg.user_id,
                         character_name=gm_msg.character_name,
+                        display_name=None,
                         content=gm_msg.content,
                         message_type=gm_msg.message_type,
                         created_at=gm_msg.created_at.isoformat(),
@@ -323,6 +433,7 @@ async def send_message(
                 )
             finally:
                 _world_processing[world_id] = False
+                _world_lock_holder.pop(world_id, None)
                 
     except HTTPException:
         raise
@@ -339,17 +450,16 @@ async def stream_messages(
     current_user: User | None = Depends(get_current_user_optional),
 ):
     """
-    SSE stream of new messages in a world.
+    SSE stream for messages - now a simple keep-alive ping stream.
     
-    Uses MongoDB Change Streams to watch for new messages.
-    Also sends processing status events.
+    NOTE: This endpoint no longer uses MongoDB Change Streams (which require 
+    replica sets). Instead, the UI uses the /updates/stream endpoint to receive
+    processing_started/processing_complete events and refreshes data accordingly.
     
-    Note: Since EventSource doesn't support custom headers, 
-    token can be passed as query parameter.
+    This endpoint is kept for backwards compatibility and connection keep-alive.
     
     Events:
-    - message: A new message was added
-    - status: Processing status
+    - status: Processing status (sent on connect)
     - ping: Keep-alive (every 30s)
     """
     from .auth import decode_token
@@ -379,57 +489,20 @@ async def stream_messages(
         raise HTTPException(status_code=403, detail="No access to this world")
     
     async def event_generator() -> AsyncGenerator[str, None]:
-        """Generate SSE events."""
+        """Generate SSE events - simple ping stream."""
         # Send initial processing status
         yield f"data: {json.dumps({'type': 'status', 'processing': is_world_processing(world_id)})}\n\n"
         
-        try:
-            # Watch for changes to the messages collection
-            pipeline = [
-                {"$match": {
-                    "operationType": "insert",
-                    "fullDocument.world_id": world_id,
-                }}
-            ]
-            
-            async with db.messages.watch(pipeline, full_document="updateLookup") as stream:
-                ping_interval = 30
-                last_ping = asyncio.get_event_loop().time()
-                
-                while True:
-                    # Check if client disconnected
-                    if await request.is_disconnected():
-                        break
-                    
-                    # Try to get next change with timeout
-                    try:
-                        change = await asyncio.wait_for(
-                            stream.try_next(),
-                            timeout=5.0
-                        )
-                        
-                        if change:
-                            doc = change.get("fullDocument")
-                            if doc:
-                                msg = Message.from_doc(doc)
-                                event_data = {
-                                    "type": "message",
-                                    "message": msg.to_public(),
-                                }
-                                yield f"data: {json.dumps(event_data)}\n\n"
-                    
-                    except asyncio.TimeoutError:
-                        pass
-                    
-                    # Send periodic ping
-                    now = asyncio.get_event_loop().time()
-                    if now - last_ping > ping_interval:
-                        yield f"data: {json.dumps({'type': 'ping'})}\n\n"
-                        last_ping = now
+        ping_interval = 30
         
-        except Exception as e:
-            logger.error(f"SSE stream error: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        while True:
+            # Check if client disconnected
+            if await request.is_disconnected():
+                break
+            
+            # Wait and send periodic ping
+            await asyncio.sleep(ping_interval)
+            yield f"data: {json.dumps({'type': 'ping'})}\n\n"
     
     return StreamingResponse(
         event_generator(),
@@ -484,14 +557,30 @@ async def get_messages(
     # Get messages
     cursor = db.messages.find(query).sort("created_at", -1).limit(limit + 1)
     
-    messages = []
+    # Collect messages and user IDs
+    raw_messages = []
+    user_ids = set()
     async for doc in cursor:
         msg = Message.from_doc(doc)
+        raw_messages.append(msg)
+        if msg.user_id:
+            user_ids.add(msg.user_id)
+    
+    # Fetch user display names
+    user_display_names: dict[str, str] = {}
+    if user_ids:
+        async for user_doc in db.users.find({"_id": {"$in": [ObjectId(uid) for uid in user_ids]}}):
+            user_display_names[str(user_doc["_id"])] = user_doc.get("display_name", "")
+    
+    # Build response
+    messages = []
+    for msg in raw_messages:
         messages.append(MessageResponse(
             id=msg.id,
             world_id=msg.world_id,
             user_id=msg.user_id,
             character_name=msg.character_name,
+            display_name=user_display_names.get(msg.user_id) if msg.user_id else None,
             content=msg.content,
             message_type=msg.message_type,
             created_at=msg.created_at.isoformat(),

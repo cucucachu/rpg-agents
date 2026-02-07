@@ -125,7 +125,7 @@ async def load_world_context(db, world_id: str) -> dict:
     
     result = {
         "world": None,
-        "characters": [],
+        "player_characters": [],  # PCs controlled by players - NEVER act or speak for these
         "active_quests": [],
         "active_encounter": None,
     }
@@ -154,7 +154,7 @@ async def load_world_context(db, world_id: str) -> dict:
             "statuses": doc.get("statuses", []),
             "abilities": [a.get("name") for a in doc.get("abilities", [])],
         }
-        result["characters"].append(char)
+        result["player_characters"].append(char)
     
     # Load active quests
     quest_cursor = db.quests.find({"world_id": world_id, "status": "active"})
@@ -181,8 +181,15 @@ async def load_world_context(db, world_id: str) -> dict:
     return result
 
 
-async def load_events_since_chronicle(db, world_id: str) -> tuple[list[dict], str | None]:
-    """Load all events since the last chronicle (or all events if no chronicle)."""
+async def load_events_since_chronicle(db, world_id: str) -> tuple[list[dict], str | None, int]:
+    """Load all events since the last chronicle (or all events if no chronicle).
+    
+    Returns:
+        tuple: (events_list, last_chronicle_id, max_game_time)
+        - events_list: Events since the last chronicle for context
+        - last_chronicle_id: ID of the most recent chronicle (or None)
+        - max_game_time: The highest game_time seen in the world (for Scribe continuity)
+    """
     from bson import ObjectId
     
     # Find the most recent chronicle
@@ -192,8 +199,9 @@ async def load_events_since_chronicle(db, world_id: str) -> tuple[list[dict], st
     )
     
     last_chronicle_id = str(last_chronicle["_id"]) if last_chronicle else None
+    chronicle_game_time_end = last_chronicle.get("game_time_end", 0) if last_chronicle else 0
     
-    # Build query for events
+    # Build query for events since chronicle (for context)
     query = {"world_id": world_id}
     if last_chronicle:
         # Events created after the chronicle
@@ -213,7 +221,19 @@ async def load_events_since_chronicle(db, world_id: str) -> tuple[list[dict], st
             "game_time": doc.get("game_time", 0),
         })
     
-    return events, last_chronicle_id
+    # Get the MAX game_time across ALL events in this world
+    # This ensures Scribe always builds on top of the highest time seen,
+    # even after a chronicle is created
+    max_game_time_doc = await db.events.find_one(
+        {"world_id": world_id},
+        sort=[("game_time", -1)]  # Highest game_time first
+    )
+    max_event_game_time = max_game_time_doc.get("game_time", 0) if max_game_time_doc else 0
+    
+    # Use the highest of: chronicle end time, or max event time
+    max_game_time = max(chronicle_game_time_end, max_event_game_time)
+    
+    return events, last_chronicle_id, max_game_time
 
 
 async def load_message_pairs(db, world_id: str, pairs: int = 10) -> list[dict]:
@@ -255,17 +275,18 @@ async def create_load_context_node(db):
         # Load world state
         world_context = await load_world_context(db, world_id)
         
-        # Load events since last chronicle
-        events, last_chronicle_id = await load_events_since_chronicle(db, world_id)
+        # Load events since last chronicle (and get max game_time from all events)
+        events, last_chronicle_id, max_game_time = await load_events_since_chronicle(db, world_id)
         
         # Extract first and last event IDs for chronicle linking
         first_event_id = events[0]["id"] if events else ""
         last_event_id = events[-1]["id"] if events else ""
         
-        # Get current game time from last event (or 0 if no events)
-        current_game_time = events[-1].get("game_time", 0) if events else 0
+        # Use max_game_time which considers ALL events (not just since chronicle)
+        # This ensures the Scribe always builds on top of the highest time seen
+        current_game_time = max_game_time
         
-        logger.info(f"Loaded context: {len(events)} events since chronicle {last_chronicle_id}, game_time={current_game_time}")
+        logger.info(f"Loaded context: {len(events)} events since chronicle {last_chronicle_id}, max_game_time={current_game_time}")
         await log_activity(db, world_id, "load_context", "status", f"Loaded {len(events)} events, world ready")
         
         return {
@@ -303,7 +324,7 @@ def create_gm_agent_node(llm_with_tools, db):
         world_context = state.get("world_context")
         if world_context:
             world_ctx = SystemMessage(
-                content=f"[CURRENT WORLD STATE]\n{world_context}\n[END WORLD STATE]"
+                content=f"[CURRENT WORLD STATE]\nNote: 'player_characters' are controlled by real players. NEVER write their actions, dialogue, or reactions.\n{world_context}\n[END WORLD STATE]"
             )
             system_messages.append(world_ctx)
         
@@ -464,8 +485,9 @@ def create_scribe_agent_node(llm_with_scribe_tools, db):
         # 6. User message asking scribe to do its job
         scribe_messages.append(HumanMessage(
             content=(
-                f"Current game time: {current_game_time} seconds ({time_str})\n\n"
-                f"Record events for this turn. Estimate game_time for each event by adding estimated duration to current time.\n"
+                f"**CURRENT GAME TIME: {current_game_time} seconds ({time_str})**\n\n"
+                f"Record events for this turn. Each event's game_time MUST be > {current_game_time}.\n"
+                f"Add estimated duration to current time (e.g., combat round +6s, dialogue +30-60s, travel +1800s).\n"
                 f"If 15+ previous events exist, consider creating a chronicle summary.{chronicle_info}"
             )
         ))
@@ -645,7 +667,11 @@ async def create_gm_agent(
     Create the GM agent graph with separated concerns.
     
     Flow:
-    load_context -> gm_agent <-> gm_tools -> capture_response -> scribe <-> scribe_tools -> cleanup -> END
+    load_context -> gm_agent <-> gm_tools -> capture_response -> scribe -> scribe_tools -> cleanup -> END
+    
+    Note: The Scribe does NOT loop back after tools execute (no scribe_tools -> scribe edge).
+    This prevents duplicate event recording if rate limiting causes LLM retries.
+    The Scribe can record events + chronicles in a single batch of tool calls.
     
     The capture_response node stores the GM's final response in state.gm_final_response
     before the scribe runs. This ensures the GM's response is preserved separately
@@ -674,9 +700,12 @@ async def create_gm_agent(
     scribe_tool_names = {"record_event", "set_chronicle"}
     scribe_tools = [t for t in all_tools if t.name in scribe_tool_names]
     
-    # GM tools = all tools EXCEPT scribe tools (separation of concerns)
+    # Tools to exclude from GM (scribe tools + deprecated/unnecessary tools)
+    gm_excluded_tools = scribe_tool_names | {"load_session"}  # load_session not needed - context is pre-loaded
+    
+    # GM tools = all tools EXCEPT excluded tools
     # The GM focuses on gameplay; the Scribe handles record-keeping
-    gm_tools = [t for t in all_tools if t.name not in scribe_tool_names]
+    gm_tools = [t for t in all_tools if t.name not in gm_excluded_tools]
     
     logger.info(f"Loaded {len(gm_tools)} GM tools, {len(scribe_tools)} scribe tools (separated)")
     
@@ -708,7 +737,7 @@ async def create_gm_agent(
     workflow.set_entry_point("load_context")
     
     # Add edges
-    # Flow: load_context -> gm_agent <-> gm_tools -> capture_response -> scribe <-> scribe_tools -> cleanup -> END
+    # Flow: load_context -> gm_agent <-> gm_tools -> capture_response -> scribe -> scribe_tools -> cleanup -> END
     workflow.add_edge("load_context", "gm_agent")
     
     workflow.add_conditional_edges(
@@ -730,12 +759,15 @@ async def create_gm_agent(
             "cleanup": "cleanup",
         }
     )
-    workflow.add_edge("scribe_tools", "scribe")
+    # NOTE: Scribe tools go directly to cleanup (no loop back to scribe)
+    # This prevents duplicate event recording if rate limiting causes retries
+    # The Scribe can record events + chronicles in a single batch of tool calls
+    workflow.add_edge("scribe_tools", "cleanup")
     workflow.add_edge("cleanup", END)
     
     # Compile
     graph = workflow.compile()
-    logger.info("Compiled GM agent graph: load_context -> gm_agent -> capture_response -> scribe -> cleanup")
+    logger.info("Compiled GM agent graph: load_context -> gm_agent <-> gm_tools -> capture_response -> scribe -> scribe_tools -> cleanup")
     
     config = {
         "provider": provider,
@@ -858,9 +890,7 @@ class GMAgent:
             for msg in history:
                 if msg["role"] == "player":
                     char_name = msg.get("character_name", "Player")
-                    content = msg["content"]
-                    if not content.startswith(f"[{char_name}]"):
-                        content = f"[{char_name}]: {content}"
+                    content = f"**Submitted by {char_name}**\n\n{msg['content']}"
                     messages.append(HumanMessage(content=content))
                 elif msg["role"] == "gm":
                     messages.append(AIMessage(content=msg["content"]))

@@ -24,6 +24,8 @@ class WorldSummary(BaseModel):
     role: str
     character_id: Optional[str]
     character_name: Optional[str]
+    last_activity: Optional[str]  # ISO timestamp of most recent message
+    last_viewed: Optional[str]    # ISO timestamp when user last viewed this world
 
 
 class WorldDetail(BaseModel):
@@ -96,7 +98,7 @@ class CreateWorldResponse(BaseModel):
 # Endpoints
 @router.get("", response_model=list[WorldSummary])
 async def list_worlds(current_user: User = Depends(get_current_user)):
-    """List all worlds the user has access to."""
+    """List all worlds the user has access to, sorted by most recent activity."""
     db = await get_db()
     
     # Get all world access records for user
@@ -123,6 +125,28 @@ async def list_worlds(current_user: User = Depends(get_current_user)):
             if char_doc:
                 character_name = char_doc.get("name")
         
+        # Get most recent message for last_activity
+        last_message = await db.messages.find_one(
+            {"world_id": access.world_id},
+            sort=[("_id", -1)]  # MongoDB ObjectId encodes timestamp
+        )
+        last_activity = None
+        if last_message and "created_at" in last_message:
+            created_at = last_message["created_at"]
+            if isinstance(created_at, datetime):
+                last_activity = created_at.isoformat()
+            else:
+                last_activity = str(created_at)
+        
+        # Get last_viewed from access record
+        last_viewed = None
+        if "last_viewed" in access_doc:
+            lv = access_doc["last_viewed"]
+            if isinstance(lv, datetime):
+                last_viewed = lv.isoformat()
+            else:
+                last_viewed = str(lv)
+        
         worlds.append(WorldSummary(
             id=str(world_doc["_id"]),
             name=world_doc.get("name", ""),
@@ -130,7 +154,12 @@ async def list_worlds(current_user: User = Depends(get_current_user)):
             role=access.role,
             character_id=access.character_id,
             character_name=character_name,
+            last_activity=last_activity,
+            last_viewed=last_viewed,
         ))
+    
+    # Sort by last_activity (most recent first), with None values at the end
+    worlds.sort(key=lambda w: w.last_activity or "", reverse=True)
     
     return worlds
 
@@ -190,6 +219,12 @@ async def get_world(world_id: str, current_user: User = Depends(get_current_user
         )
     
     access = WorldAccess.from_doc(access_doc)
+    
+    # Update last_viewed timestamp
+    await db.world_access.update_one(
+        {"user_id": current_user.id, "world_id": world_id},
+        {"$set": {"last_viewed": datetime.utcnow()}}
+    )
     
     # Get world - handle both ObjectId and string IDs
     try:

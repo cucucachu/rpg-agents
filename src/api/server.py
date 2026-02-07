@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from ..agent import create_gm_agent, GM_SYSTEM_PROMPT
 from ..agent.gm_agent import GMAgent
 from ..db import connect_db, close_db
-from . import auth, worlds, websocket as ws_module, messages as messages_module, events as events_module, activity as activity_module
+from . import auth, worlds, websocket as ws_module, messages as messages_module, events as events_module, activity as activity_module, updates as updates_module
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -93,6 +93,7 @@ def create_app() -> FastAPI:
     app.include_router(messages_module.router)  # New message endpoints
     app.include_router(events_module.router)  # Events endpoint
     app.include_router(activity_module.router)  # Agent activity stream
+    app.include_router(updates_module.router)  # Multi-user update notifications
     
     return app
 

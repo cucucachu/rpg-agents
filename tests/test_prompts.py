@@ -17,9 +17,9 @@ def test_system_prompt_contains_key_sections():
     """Verify system prompt contains essential guidance."""
     assert "Game Master" in GM_SYSTEM_PROMPT
     assert "Tool Usage" in GM_SYSTEM_PROMPT
-    assert "load_session" in GM_SYSTEM_PROMPT
     assert "roll_dice" in GM_SYSTEM_PROMPT
     assert "world.settings" in GM_SYSTEM_PROMPT
+    assert "Multi-Player" in GM_SYSTEM_PROMPT  # Multiplayer awareness
 
 
 def test_minimal_prompt_exists():

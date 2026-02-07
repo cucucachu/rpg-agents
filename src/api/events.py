@@ -68,13 +68,15 @@ async def get_events(
     query = {"world_id": world_id}
     if before:
         try:
-            # Get events older than the 'before' event
+            # Get events with earlier _id (older insertion time)
             query["_id"] = {"$lt": ObjectId(before)}
         except Exception:
             pass
     
-    # Get events sorted by _id descending (newest first), fetch limit+1 to check for more
-    cursor = db.events.find(query).sort("_id", -1).limit(limit + 1)
+    # Sort by _id descending (newest insertion first)
+    # NOTE: game_time is currently unreliable (Scribe assigns inconsistent values),
+    # so we use _id which reflects actual insertion order
+    cursor = db.events.find(query).sort([("_id", -1)]).limit(limit + 1)
     
     events = []
     async for doc in cursor:
