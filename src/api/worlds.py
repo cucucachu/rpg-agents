@@ -7,9 +7,30 @@ from fastapi import APIRouter, HTTPException, Depends, Query, status
 from pydantic import BaseModel
 from bson import ObjectId
 
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
 from ..db import get_db
 from ..models import User, WorldAccess, WorldCode, Message
 from .auth import get_current_user
+
+
+async def _get_world_game_time(db: AsyncIOMotorDatabase, world_id: str) -> int:
+    """Derive current game time from events (and chronicles as fallback)."""
+    max_event = await db.events.find_one(
+        {"world_id": world_id},
+        {"game_time": 1},
+        sort=[("game_time", -1)],
+    )
+    max_event_time = max_event.get("game_time", 0) if max_event else 0
+    
+    last_chronicle = await db.chronicles.find_one(
+        {"world_id": world_id},
+        {"game_time_end": 1},
+        sort=[("_id", -1)],
+    )
+    chronicle_end = last_chronicle.get("game_time_end") or 0 if last_chronicle else 0
+    
+    return max(max_event_time, chronicle_end)
 
 # Router
 router = APIRouter(prefix="/worlds", tags=["worlds"])
@@ -172,12 +193,12 @@ async def create_world(
     """Create a new empty world. The creator becomes a 'god' of the world."""
     db = await get_db()
     
-    # Create the world document
+    # Create the world document (game_time now derived from events)
     world_doc = {
         "name": request.name,
         "description": "",  # Empty, to be filled by GM agent
         "settings": {},
-        "game_time": 0,
+        "creation_in_progress": True,  # GM uses update_world_basics + start_game to finish
         "created_at": datetime.utcnow(),
         "created_by": current_user.id,
     }
@@ -185,11 +206,31 @@ async def create_world(
     result = await db.worlds.insert_one(world_doc)
     world_id = str(result.inserted_id)
     
-    # Create world access - creator is a god
+    # Create skeleton PC for the creator
+    character_doc = {
+        "world_id": world_id,
+        "name": "New Character",
+        "description": "",
+        "is_player_character": True,
+        "creation_in_progress": True,
+        "level": 1,
+        "attributes": [],
+        "skills": [],
+        "abilities": [],
+        "statuses": [],
+        "factions": [],
+        "tags": [],
+        "metadata": {},
+    }
+    char_result = await db.characters.insert_one(character_doc)
+    character_id = str(char_result.inserted_id)
+    
+    # Create world access - creator is a god, linked to their PC
     world_access = WorldAccess(
         user_id=current_user.id,
         world_id=world_id,
         role="god",
+        character_id=character_id,
     )
     await db.world_access.insert_one(world_access.to_doc())
     
@@ -246,12 +287,14 @@ async def get_world(world_id: str, current_user: User = Depends(get_current_user
             char_doc["_id"] = str(char_doc["_id"])
             character = char_doc
     
+    game_time = await _get_world_game_time(db, world_id)
+    
     return WorldDetail(
         id=str(world_doc["_id"]),
         name=world_doc.get("name", ""),
         description=world_doc.get("description", ""),
         settings=world_doc.get("settings", {}),
-        game_time=world_doc.get("game_time", 0),
+        game_time=game_time,
         role=access.role,
         character=character,
     )
@@ -369,11 +412,31 @@ async def join_world(
             detail="World not found",
         )
     
-    # Create world access as mortal
+    # Create skeleton PC for the joining user
+    character_doc = {
+        "world_id": world_code.world_id,
+        "name": "New Character",
+        "description": "",
+        "is_player_character": True,
+        "creation_in_progress": True,
+        "level": 1,
+        "attributes": [],
+        "skills": [],
+        "abilities": [],
+        "statuses": [],
+        "factions": [],
+        "tags": [],
+        "metadata": {},
+    }
+    char_result = await db.characters.insert_one(character_doc)
+    character_id = str(char_result.inserted_id)
+    
+    # Create world access as mortal, linked to their PC
     world_access = WorldAccess(
         user_id=current_user.id,
         world_id=world_code.world_id,
         role="mortal",
+        character_id=character_id,
     )
     await db.world_access.insert_one(world_access.to_doc())
     
