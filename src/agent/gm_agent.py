@@ -2,15 +2,23 @@
 
 Architecture:
 1. load_context - Deterministic node that fetches world state, events, messages
-2. gm_agent - Main game master agent with all game tools
-3. capture_response - Captures GM response before scribe runs
-4. scribe_agent - Post-processing agent that creates events and chronicles
-5. cleanup - Cleans up agent activity records from the database
+2. historian - Enriches context with search (lore, characters, locations, events)
+3. compile_historian - Captures historian output as enriched_context
+4. gm_agent - Main game master agent (narration, dice, combat management)
+5. capture_response - Captures GM response and tool calls
+6. bard - Records new NPCs, locations, lore, factions from narrative
+7. accountant_agent - Syncs game state (damage, healing, status, items) to database
+8. scribe_agent - Records events and chronicles
+9. debug_state - Logs full state at end of turn (if DEBUG=true)
+
+Flow:
+load_context -> historian <-> historian_tools -> compile_historian -> gm_agent <-> gm_tools -> capture_response -> bard <-> bard_tools -> (if creation_in_progress: debug_state else: accountant -> ... -> debug_state) -> END
 """
 
 import logging
 import time
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any, Literal, TypedDict, Annotated
 import operator
@@ -20,40 +28,29 @@ from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-from .prompts import GM_SYSTEM_PROMPT, SCRIBE_SYSTEM_PROMPT
+from .prompts import (
+    GM_SYSTEM_PROMPT,
+    HISTORIAN_SYSTEM_PROMPT,
+    BARD_SYSTEM_PROMPT,
+    SCRIBE_SYSTEM_PROMPT,
+    ACCOUNTANT_SYSTEM_PROMPT,
+    WORLD_CREATOR_SYSTEM_PROMPT,
+    CHAR_CREATOR_SYSTEM_PROMPT,
+)
 from .mcp_tools import get_mcp_tools, get_mcp_client
+
+# Debug mode - controls verbose state logging and debug-level logging
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# Activity Logging Helper
-# ============================================================================
-
-async def log_activity(db, world_id: str, node_name: str, activity_type: str, content: str) -> None:
-    """Log agent activity to the database for streaming to UI.
-    
-    Args:
-        db: MongoDB database connection
-        world_id: The world being processed
-        node_name: Which graph node is logging (load_context, gm_agent, scribe, etc.)
-        activity_type: Type of activity (thinking, tool_call, tool_result, response, status)
-        content: The activity text (truncated for display)
-    """
-    try:
-        # Truncate content to 100 chars for display
-        display_content = content[:100] if len(content) > 100 else content
-        
-        await db.agent_activity.insert_one({
-            "world_id": world_id,
-            "node_name": node_name,
-            "activity_type": activity_type,
-            "content": display_content,
-            "created_at": datetime.now(timezone.utc),
-        })
-    except Exception as e:
-        # Don't let activity logging errors break the agent
-        logger.warning(f"Failed to log activity: {e}")
+# Configure logger based on DEBUG environment variable
+if DEBUG:
+    logger.setLevel(logging.DEBUG)
+    # Also set the root logger to DEBUG if not already configured
+    root_logger = logging.getLogger()
+    if root_logger.level == logging.NOTSET or root_logger.level > logging.DEBUG:
+        root_logger.setLevel(logging.DEBUG)
 
 
 # ============================================================================
@@ -70,8 +67,17 @@ class GMAgentState(TypedDict, total=False):
     # Core identifiers
     world_id: str
     
-    # Messages (conversation) - uses operator.add to accumulate messages
+    # Messages (conversation history, read-only) - uses operator.add to accumulate messages
     messages: Annotated[list[BaseMessage], operator.add]
+
+    # Per-agent isolated message lists for ReAct loops and context isolation
+    historian_messages: Annotated[list[BaseMessage], operator.add]
+    gm_messages: Annotated[list[BaseMessage], operator.add]
+    bard_messages: Annotated[list[BaseMessage], operator.add]
+    accountant_messages: Annotated[list[BaseMessage], operator.add]
+    scribe_messages: Annotated[list[BaseMessage], operator.add]
+    world_creator_messages: Annotated[list[BaseMessage], operator.add]
+    char_creator_messages: Annotated[list[BaseMessage], operator.add]
     
     # How many messages in the initial state were history (before this turn)
     # Used by scribe to identify which messages are "this turn"
@@ -80,6 +86,7 @@ class GMAgentState(TypedDict, total=False):
     # Loaded context (populated by load_context node)
     world_context: str  # JSON string of world data
     events_context: str  # JSON string of events since last chronicle
+    enriched_context: str  # JSON string from Historian (additional findings)
     last_chronicle_id: str  # ID of most recent chronicle
     first_event_id: str  # First event ID since last chronicle (for linking)
     last_event_id: str  # Last event ID since last chronicle (for linking)
@@ -88,6 +95,16 @@ class GMAgentState(TypedDict, total=False):
     # GM's final response (captured before scribe runs)
     # This is what gets persisted to the database
     gm_final_response: str
+    
+    # GM's tool calls (captured for Accountant to avoid duplicates)
+    # Contains list of tool call dicts with 'name' and 'args'
+    gm_tool_calls: list[dict]
+    
+    # World creation phase: when True, route to world_creator agent
+    creation_in_progress: bool
+    
+    # Character creation phase: when True, route to char_creator agent
+    needs_character_creation: bool
 
 
 # ============================================================================
@@ -138,7 +155,7 @@ async def load_world_context(db, world_id: str) -> dict:
             "name": world_doc.get("name"),
             "description": world_doc.get("description"),
             "settings": world_doc.get("settings", {}),
-            "game_time": world_doc.get("game_time", 0),
+            "creation_in_progress": world_doc.get("creation_in_progress", False),
         }
     
     # Load player characters
@@ -270,10 +287,11 @@ async def create_load_context_node(db):
             return {}
         
         logger.info(f"Loading context for world {world_id}")
-        await log_activity(db, world_id, "load_context", "status", "Loading world context...")
+        logger.debug(f"[load_context] world_id={world_id}")
         
         # Load world state
         world_context = await load_world_context(db, world_id)
+        logger.debug(f"[load_context] world_context: {len(world_context.get('player_characters', []))} PCs, {len(world_context.get('active_quests', []))} quests, encounter={bool(world_context.get('active_encounter'))}")
         
         # Load events since last chronicle (and get max game_time from all events)
         events, last_chronicle_id, max_game_time = await load_events_since_chronicle(db, world_id)
@@ -287,7 +305,9 @@ async def create_load_context_node(db):
         current_game_time = max_game_time
         
         logger.info(f"Loaded context: {len(events)} events since chronicle {last_chronicle_id}, max_game_time={current_game_time}")
-        await log_activity(db, world_id, "load_context", "status", f"Loaded {len(events)} events, world ready")
+        logger.debug(f"[load_context] first_event_id={first_event_id}, last_event_id={last_event_id}")
+        
+        creation_in_progress = world_context.get("world", {}).get("creation_in_progress", False)
         
         return {
             "world_context": json.dumps(world_context, indent=2),
@@ -296,9 +316,60 @@ async def create_load_context_node(db):
             "first_event_id": first_event_id,
             "last_event_id": last_event_id,
             "current_game_time": current_game_time,
+            "creation_in_progress": creation_in_progress,
         }
     
     return load_context_node
+
+
+# ============================================================================
+# Node: Historian Agent (context enrichment - read-only search)
+# ============================================================================
+
+def create_historian_agent_node(llm_with_historian_tools, db):
+    """Create the Historian agent node that searches for relevant context."""
+
+    async def historian_agent_node(state: GMAgentState) -> dict[str, Any]:
+        """Analyze context and user message, search for additional detail, return findings."""
+        messages = list(state.get("historian_messages", []))
+        world_id = state.get("world_id")
+
+        logger.debug(f"[historian] Invoking with {len(messages)} messages")
+
+        response = await llm_with_historian_tools.ainvoke(messages)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        has_tools = bool(tool_calls)
+        logger.debug(f"[historian] response: tool_calls={has_tools}, tools={[tc['name'] for tc in tool_calls]}, content_len={len(response.content or '')}")
+
+        return {"historian_messages": [response]}
+
+    return historian_agent_node
+
+
+def compile_historian_context_node(state: GMAgentState) -> dict[str, Any]:
+    """Capture historian output (and tool results) into enriched_context for the GM."""
+    messages = state.get("historian_messages", [])
+    # All historian messages except the initial system messages
+    parts = []
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            content = getattr(msg, "content", None)
+            if content:
+                # Ensure content is a string (it might be a list of content blocks)
+                if isinstance(content, list):
+                    content = str(content)
+                parts.append(content)
+        elif isinstance(msg, ToolMessage):
+            content = getattr(msg, "content", None) or str(msg)
+            # Ensure content is a string
+            if isinstance(content, list):
+                content = str(content)
+            if len(str(content)) > 2000:
+                content = str(content)[:2000] + "..."
+            parts.append(f"{getattr(msg, 'name', 'tool')}: {content}")
+    enriched_context = "\n\n".join(parts) if parts else "{}"
+    logger.debug(f"[compile_historian] enriched_context len={len(enriched_context)}, parts={len(parts)}")
+    return {"enriched_context": enriched_context}
 
 
 # ============================================================================
@@ -310,55 +381,18 @@ def create_gm_agent_node(llm_with_tools, db):
     
     async def gm_agent_node(state: GMAgentState) -> dict[str, Any]:
         """Process messages and generate GM response."""
-        messages = list(state.get("messages", []))
+        messages = list(state.get("gm_messages", []))
         world_id = state.get("world_id")
         
-        # Log thinking activity
-        if world_id:
-            await log_activity(db, world_id, "gm_agent", "thinking", "GM is thinking...")
-        
-        # Build system messages
-        system_messages = [SystemMessage(content=GM_SYSTEM_PROMPT)]
-        
-        # Inject world context
-        world_context = state.get("world_context")
-        if world_context:
-            world_ctx = SystemMessage(
-                content=f"[CURRENT WORLD STATE]\nNote: 'player_characters' are controlled by real players. NEVER write their actions, dialogue, or reactions.\n{world_context}\n[END WORLD STATE]"
-            )
-            system_messages.append(world_ctx)
-        
-        # Inject events context (critical for narrative consistency)
-        events_context = state.get("events_context")
-        if events_context:
-            events_ctx = SystemMessage(
-                content=f"[EVENTS SINCE LAST CHRONICLE - These are the canonical events that have occurred. Your narrative MUST be consistent with these.]\n{events_context}\n[END EVENTS]"
-            )
-            system_messages.append(events_ctx)
-        
-        # Inject world_id for tool calls
-        if world_id:
-            world_id_ctx = SystemMessage(
-                content=f"[WORLD ID]\nworld_id for all tool calls: {world_id}\n[END WORLD ID]"
-            )
-            system_messages.append(world_id_ctx)
-        
-        # Combine system messages with conversation
-        full_messages = system_messages + messages
-        
+        logger.debug(f"[gm_agent] Invoking with {len(messages)} messages")
+
         # Invoke LLM
-        response = await llm_with_tools.ainvoke(full_messages)
+        response = await llm_with_tools.ainvoke(messages)
         
-        # Log the response
-        if world_id:
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                tool_names = [tc["name"] for tc in response.tool_calls]
-                await log_activity(db, world_id, "gm_agent", "tool_call", f"Calling: {', '.join(tool_names)}")
-            elif response.content:
-                preview = response.content[:50].replace('\n', ' ')
-                await log_activity(db, world_id, "gm_agent", "response", preview)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        logger.debug(f"[gm_agent] response: tool_calls={len(tool_calls)} {[tc['name'] for tc in tool_calls]}, content_len={len(response.content or '')}")
         
-        return {"messages": [response]}
+        return {"gm_messages": [response]}
     
     return gm_agent_node
 
@@ -402,6 +436,67 @@ def _extract_this_turn_content(messages: list[BaseMessage], history_count: int) 
     return "\n\n".join(parts) if parts else "No significant activity this turn."
 
 
+# ============================================================================
+# Node: Accountant Agent (state sync)
+# ============================================================================
+
+def create_accountant_agent_node(llm_with_accountant_tools, db):
+    """
+    Create the Accountant agent node that syncs game state to the database.
+    
+    The Accountant reviews the GM's narrative and makes tool calls to persist
+    any state changes (damage, healing, status effects, movement, items) that
+    the GM narrated but didn't explicitly call tools for.
+    
+    Args:
+        llm_with_accountant_tools: LLM with accountant tools bound
+        db: Database connection for activity logging
+    """
+    
+    async def accountant_agent_node(state: GMAgentState) -> dict[str, Any]:
+        """Review GM's response and sync any state changes to the database."""
+        messages = list(state.get("accountant_messages", []))
+        world_id = state.get("world_id")
+        
+        logger.debug(f"[accountant] Invoking with {len(messages)} messages")
+        
+        # Invoke accountant LLM
+        response = await llm_with_accountant_tools.ainvoke(messages)
+        
+        # Debug logging
+        acct_tools = getattr(response, "tool_calls", None) or []
+        has_tool_calls = bool(acct_tools)
+        logger.info(f"[Accountant] Response: has_tool_calls={has_tool_calls}, content_length={len(response.content) if response.content else 0}")
+        logger.debug(f"[accountant] response tool_calls={[tc['name'] for tc in acct_tools]}")
+        
+        return {"accountant_messages": [response]}
+    
+    return accountant_agent_node
+
+
+# ============================================================================
+# Node: Bard Agent (entity recording)
+# ============================================================================
+
+def create_bard_agent_node(llm_with_bard_tools, db):
+    """Create the Bard agent node that records new entities from the GM's narrative."""
+
+    async def bard_agent_node(state: GMAgentState) -> dict[str, Any]:
+        """Review GM's narrative and create/update records for NPCs, locations, lore, factions."""
+        messages = list(state.get("bard_messages", []))
+        world_id = state.get("world_id")
+
+        logger.debug(f"[bard] Invoking with {len(messages)} messages")
+
+        response = await llm_with_bard_tools.ainvoke(messages)
+        bard_tools = getattr(response, "tool_calls", None) or []
+        logger.info(f"[Bard] Routing to {'tools' if bard_tools else 'accountant'}: {[tc['name'] for tc in bard_tools] if bard_tools else 'none'}")
+
+        return {"bard_messages": [response]}
+
+    return bard_agent_node
+
+
 def create_scribe_agent_node(llm_with_scribe_tools, db):
     """
     Create the Scribe agent node that records events and chronicles.
@@ -413,108 +508,21 @@ def create_scribe_agent_node(llm_with_scribe_tools, db):
     
     async def scribe_agent_node(state: GMAgentState) -> dict[str, Any]:
         """Review this turn and create events/chronicles."""
-        messages = list(state.get("messages", []))
+        messages = list(state.get("scribe_messages", []))
         world_id = state.get("world_id")
         
-        # Get history count from state (set when stream_chat is called)
-        hist_count = state.get("history_message_count", 0)
-        
-        # Log scribe activity
-        if world_id:
-            await log_activity(db, world_id, "scribe", "thinking", "Scribe recording this turn...")
-        
-        # =====================================================================
-        # Build scribe context - ONLY what the scribe needs
-        # =====================================================================
-        
-        # 1. System prompt
-        scribe_messages = [SystemMessage(content=SCRIBE_SYSTEM_PROMPT)]
-        
-        # 2. World ID for tool calls
-        if world_id:
-            scribe_messages.append(SystemMessage(
-                content=f"world_id for tool calls: {world_id}"
-            ))
-        
-        # 3. Context from BEFORE this turn (world state + previous events)
-        context_parts = []
-        
-        world_context = state.get("world_context")
-        if world_context:
-            context_parts.append(f"WORLD STATE:\n{world_context}")
-        
-        events_context = state.get("events_context")
-        if events_context:
-            context_parts.append(f"PREVIOUS EVENTS (already recorded, do not duplicate):\n{events_context}")
-        
-        if context_parts:
-            scribe_messages.append(SystemMessage(
-                content="=== CONTEXT FROM BEFORE THIS TURN ===\n\n" + "\n\n---\n\n".join(context_parts)
-            ))
-        
-        # 4. THIS TURN's content - extracted and formatted clearly
-        #    These are NOT the scribe's thoughts - this is what happened in the game
-        this_turn_content = _extract_this_turn_content(messages, hist_count)
-        
-        scribe_messages.append(SystemMessage(
-            content=(
-                "=== THIS TURN (what just happened - record this) ===\n\n"
-                "The following is a transcript of the player's action and the GM's response. "
-                "This is NOT your communication - this is what you must record as events.\n\n"
-                f"{this_turn_content}"
-            )
-        ))
-        
-        # 5. Event IDs for chronicle linking and game time
-        first_event_id = state.get("first_event_id", "")
-        last_event_id = state.get("last_event_id", "")
-        current_game_time = state.get("current_game_time", 0)
-        event_count = len(json.loads(events_context)) if events_context else 0
-        
-        # Format game time for readability
-        days = current_game_time // 86400
-        remaining = current_game_time % 86400
-        hours = remaining // 3600
-        minutes = (remaining % 3600) // 60
-        time_str = f"Day {days + 1}, {hours:02d}:{minutes:02d}"
-        
-        chronicle_info = ""
-        if first_event_id and last_event_id:
-            chronicle_info = f"\n\nIf creating a chronicle: use start_event_id={first_event_id} and end_event_id={last_event_id} to link the {event_count} events."
-        
-        # 6. User message asking scribe to do its job
-        scribe_messages.append(HumanMessage(
-            content=(
-                f"**CURRENT GAME TIME: {current_game_time} seconds ({time_str})**\n\n"
-                f"Record events for this turn. Each event's game_time MUST be > {current_game_time}.\n"
-                f"Add estimated duration to current time (e.g., combat round +6s, dialogue +30-60s, travel +1800s).\n"
-                f"If 15+ previous events exist, consider creating a chronicle summary.{chronicle_info}"
-            )
-        ))
-        
-        logger.info(f"[Scribe] Processing turn: {len(messages)} total messages, {hist_count} history, this_turn has {len(messages) - hist_count} messages")
+        logger.debug(f"[scribe] Invoking with {len(messages)} messages")
         
         # Invoke scribe LLM
-        response = await llm_with_scribe_tools.ainvoke(scribe_messages)
+        response = await llm_with_scribe_tools.ainvoke(messages)
         
         # Debug logging
-        has_tool_calls = hasattr(response, "tool_calls") and response.tool_calls
-        logger.info(f"[Scribe] Response: has_tool_calls={bool(has_tool_calls)}, content_length={len(response.content) if response.content else 0}")
-        if response.content:
-            logger.info(f"[Scribe] Content: {response.content[:200]}")
-        if has_tool_calls:
-            logger.info(f"[Scribe] Tool calls: {[tc['name'] for tc in response.tool_calls]}")
+        scribe_tools = getattr(response, "tool_calls", None) or []
+        has_tool_calls = bool(scribe_tools)
+        logger.info(f"[Scribe] Response: has_tool_calls={has_tool_calls}, content_length={len(response.content) if response.content else 0}")
+        logger.debug(f"[scribe] response tool_calls={[tc['name'] for tc in scribe_tools]}, content_preview={repr((response.content or '')[:150])}")
         
-        # Log the response to activity stream
-        if world_id:
-            if has_tool_calls:
-                tool_names = [tc["name"] for tc in response.tool_calls]
-                await log_activity(db, world_id, "scribe", "tool_call", f"Recording: {', '.join(tool_names)}")
-            elif response.content:
-                preview = response.content[:50].replace('\n', ' ')
-                await log_activity(db, world_id, "scribe", "status", preview)
-        
-        return {"messages": [response]}
+        return {"scribe_messages": [response]}
     
     return scribe_agent_node
 
@@ -523,13 +531,20 @@ def create_scribe_agent_node(llm_with_scribe_tools, db):
 # Tool Node Factory
 # ============================================================================
 
-def create_logging_tool_node(tools, db, node_name: str = "tools"):
-    """Create a tool node with logging."""
+def create_logging_tool_node(tools, db, node_name: str = "tools", messages_key: str = "messages"):
+    """Create a tool node with logging that reads/writes to a specific message stream.
+    
+    Args:
+        tools: List of tools available to this node
+        db: Database connection for activity logging
+        node_name: Display name for logging
+        messages_key: State key for the message list (e.g. "messages", "bard_messages")
+    """
     base_tool_node = ToolNode(tools)
     
     async def logging_tool_node(state: GMAgentState) -> dict[str, Any]:
         """Wrapper that logs tool execution timing."""
-        messages = state.get("messages", [])
+        messages = state.get(messages_key, [])
         world_id = state.get("world_id")
         last_message = messages[-1] if messages else None
         
@@ -539,12 +554,9 @@ def create_logging_tool_node(tools, db, node_name: str = "tools"):
             
             start_time = time.time()
             logger.info(f"[{node_name}] Executing {len(tool_calls)} tool(s): {tool_names}")
+            logger.debug(f"[{node_name}] tool_calls args (truncated): {[(tc.get('name'), str(tc.get('args', {}))[:80]) for tc in tool_calls]}")
             
-            # Log activity
-            if world_id:
-                await log_activity(db, world_id, node_name.lower(), "tool_call", f"Executing: {', '.join(tool_names)}")
-            
-            # Execute via the base ToolNode
+            # Execute via the base ToolNode (always uses "messages" key)
             result = await base_tool_node.ainvoke({"messages": messages})
             
             elapsed = time.time() - start_time
@@ -556,14 +568,17 @@ def create_logging_tool_node(tools, db, node_name: str = "tools"):
                     if isinstance(msg, ToolMessage):
                         content_preview = str(msg.content)[:50] if len(str(msg.content)) > 50 else str(msg.content)
                         logger.info(f"  [{node_name}] Tool result [{msg.name}]: {content_preview}")
-                        
-                        # Log activity for tool result
-                        if world_id:
-                            await log_activity(db, world_id, node_name.lower(), "tool_result", f"{msg.name}: {content_preview}")
             
+            # Re-map "messages" -> messages_key for correct state field
+            if "messages" in result:
+                return {messages_key: result["messages"]}
             return result
         
-        return await base_tool_node.ainvoke({"messages": messages})
+        # No tool calls - invoke base node
+        result = await base_tool_node.ainvoke({"messages": messages})
+        if "messages" in result:
+            return {messages_key: result["messages"]}
+        return result
     
     return logging_tool_node
 
@@ -573,14 +588,15 @@ def create_logging_tool_node(tools, db, node_name: str = "tools"):
 # ============================================================================
 
 def capture_gm_response_node(state: GMAgentState) -> dict[str, Any]:
-    """Capture the GM's final response before transitioning to scribe.
+    """Capture the GM's final response and tool calls before transitioning to accountant/scribe.
     
-    This ensures we have the GM's response stored separately from
-    any subsequent scribe messages.
+    This ensures we have:
+    1. The GM's response stored separately from subsequent agent messages
+    2. A record of all tool calls the GM made (for Accountant to avoid duplicates)
     """
-    messages = state.get("messages", [])
+    messages = state.get("gm_messages", [])
     
-    # Find the last AI message that has content and no tool calls
+    # Find the last AI message that has content and no tool calls (the final response)
     gm_response = None
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
@@ -588,68 +604,646 @@ def capture_gm_response_node(state: GMAgentState) -> dict[str, Any]:
                 gm_response = msg.content
                 break
     
+    # Collect ALL tool calls made by GM (for Accountant to know what's already done)
+    gm_tool_calls = []
+    for msg in messages:
+        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                gm_tool_calls.append({
+                    "name": tc.get("name"),
+                    "args": tc.get("args", {})
+                })
+    
     if gm_response:
         logger.info(f"[Capture] Captured GM response: {gm_response[:100]}...")
+        logger.debug(f"[capture_response] gm_final_response len={len(gm_response)}")
     else:
         logger.warning("[Capture] No GM response found to capture")
     
-    return {"gm_final_response": gm_response}
+    if gm_tool_calls:
+        tool_names = [tc["name"] for tc in gm_tool_calls]
+        logger.info(f"[Capture] GM made {len(gm_tool_calls)} tool calls: {tool_names}")
+        logger.debug(f"[capture_response] gm_tool_calls: {tool_names}")
+    
+    return {
+        "gm_final_response": gm_response,
+        "gm_tool_calls": gm_tool_calls
+    }
+
+
+# ============================================================================
+# Init Nodes (build initial message context for each agent)
+# ============================================================================
+
+def historian_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for Historian agent."""
+    world_id = state.get("world_id")
+    world_context = state.get("world_context")
+    events_context = state.get("events_context")
+    messages = list(state.get("messages", []))
+    history_count = state.get("history_message_count", 0)
+    
+    logger.debug(f"[historian_init] Building context for historian")
+    
+    historian_messages = [SystemMessage(content=HISTORIAN_SYSTEM_PROMPT)]
+    if world_id:
+        historian_messages.append(SystemMessage(content=f"[WORLD ID]\nworld_id for all tool calls: {world_id}\n[END WORLD ID]"))
+    if world_context:
+        historian_messages.append(SystemMessage(content=f"[WORLD STATE]\n{world_context}\n[END WORLD STATE]"))
+    if events_context:
+        historian_messages.append(SystemMessage(content=f"[RECENT EVENTS]\n{events_context}\n[END RECENT EVENTS]"))
+    
+    # Current turn user message
+    if history_count < len(messages):
+        player_msg = messages[history_count]
+        if hasattr(player_msg, "content"):
+            historian_messages.append(SystemMessage(content=f"[PLAYER MESSAGE]\n{player_msg.content}\n[END PLAYER MESSAGE]"))
+    
+    historian_messages.append(HumanMessage(content="Identify any characters, locations, lore, or events referenced above that lack detail. Search for additional information and return a brief JSON summary of what you found (or empty {} if nothing to add)."))
+    
+    return {"historian_messages": historian_messages}
+
+
+def gm_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for GM agent."""
+    world_id = state.get("world_id")
+    world_context = state.get("world_context")
+    events_context = state.get("events_context")
+    enriched_context = state.get("enriched_context")
+    messages = list(state.get("messages", []))
+    
+    logger.debug(f"[gm_init] Building context for GM agent")
+    
+    # Build system messages
+    system_messages = [SystemMessage(content=GM_SYSTEM_PROMPT)]
+    
+    # Inject world context
+    if world_context:
+        world_ctx = SystemMessage(
+            content=f"[CURRENT WORLD STATE]\nNote: 'player_characters' are controlled by real players. NEVER write their actions, dialogue, or reactions.\n{world_context}\n[END WORLD STATE]"
+        )
+        system_messages.append(world_ctx)
+    
+    # Inject events context (critical for narrative consistency)
+    if events_context:
+        events_ctx = SystemMessage(
+            content=f"[EVENTS SINCE LAST CHRONICLE - These are the canonical events that have occurred. Your narrative MUST be consistent with these.]\n{events_context}\n[END EVENTS]"
+        )
+        system_messages.append(events_ctx)
+
+    # Inject enriched context from Historian (additional findings)
+    if enriched_context:
+        system_messages.append(
+            SystemMessage(content=f"[ENRICHED CONTEXT - Additional detail from the Historian.]\n{enriched_context}\n[END ENRICHED CONTEXT]")
+        )
+
+    # Inject world_id for tool calls
+    if world_id:
+        world_id_ctx = SystemMessage(
+            content=f"[WORLD ID]\nworld_id for all tool calls: {world_id}\n[END WORLD ID]"
+        )
+        system_messages.append(world_id_ctx)
+    
+    # Combine system messages with conversation
+    gm_messages = system_messages + messages
+    logger.debug(f"[gm_init] Built {len(system_messages)} system + {len(messages)} conversation = {len(gm_messages)} total")
+    
+    return {"gm_messages": gm_messages}
+
+
+def bard_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for Bard agent."""
+    world_id = state.get("world_id")
+    world_context = state.get("world_context")
+    gm_response = state.get("gm_final_response", "")
+    gm_tool_calls = state.get("gm_tool_calls", [])
+    
+    logger.debug(f"[bard_init] Building context for Bard")
+    
+    bard_messages = [SystemMessage(content=BARD_SYSTEM_PROMPT)]
+    if world_id:
+        bard_messages.append(SystemMessage(content=f"[WORLD ID]\nworld_id for all tool calls: {world_id}\n[END WORLD ID]"))
+    if world_context:
+        bard_messages.append(SystemMessage(content=f"[WORLD STATE]\n{world_context}\n[END WORLD STATE]"))
+    if gm_tool_calls:
+        tool_summary = "\n".join([f"- {tc.get('name')}({tc.get('args', {})})" for tc in gm_tool_calls])
+        bard_messages.append(SystemMessage(content=f"[TOOLS GM ALREADY CALLED - do NOT duplicate]\n{tool_summary}\n[END]"))
+    if gm_response:
+        bard_messages.append(SystemMessage(content=f"[GM'S NARRATIVE]\n{gm_response}\n[END NARRATIVE]"))
+    bard_messages.append(HumanMessage(content="Identify any NEW named NPCs, locations, lore, or factions mentioned in the narrative. First, search for them to check if they exist. Then create NEW entities or update EXISTING entities with new information. Batch your searches first, then batch your creates/updates. If nothing new to record, respond with 'No new entities to record.'"))
+    
+    return {"bard_messages": bard_messages}
+
+
+def accountant_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for Accountant agent."""
+    world_id = state.get("world_id")
+    world_context = state.get("world_context")
+    gm_response = state.get("gm_final_response", "")
+    gm_tool_calls = state.get("gm_tool_calls", [])
+    
+    logger.debug(f"[accountant_init] Building context for Accountant")
+    
+    # 1. System prompt
+    accountant_messages = [SystemMessage(content=ACCOUNTANT_SYSTEM_PROMPT)]
+    
+    # 2. World ID for tool calls
+    if world_id:
+        accountant_messages.append(SystemMessage(
+            content=f"world_id for tool calls: {world_id}"
+        ))
+    
+    # 3. World state (characters with IDs, locations, etc.)
+    if world_context:
+        accountant_messages.append(SystemMessage(
+            content=f"=== WORLD STATE (use these IDs for tool calls) ===\n\n{world_context}"
+        ))
+    
+    # 4. GM's final response (what we need to sync)
+    if gm_response:
+        accountant_messages.append(SystemMessage(
+            content=f"=== GM'S NARRATIVE (sync state changes from this) ===\n\n{gm_response}"
+        ))
+    
+    # 5. Tools the GM already called (don't duplicate these)
+    if gm_tool_calls:
+        tool_call_summary = "\n".join([
+            f"- {tc['name']}({', '.join(f'{k}={v}' for k, v in tc['args'].items())})"
+            for tc in gm_tool_calls
+        ])
+        accountant_messages.append(SystemMessage(
+            content=f"=== TOOLS GM ALREADY CALLED (do NOT duplicate) ===\n\n{tool_call_summary}"
+        ))
+    
+    # 6. Instruction to do the work
+    accountant_messages.append(HumanMessage(
+        content=(
+            "Review the GM's narrative above and sync any state changes to the database.\n\n"
+            "Look for:\n"
+            "- Damage dealt (HP reductions)\n"
+            "- Healing received\n"
+            "- Status effects applied or removed\n"
+            "- Items given, dropped, or created\n"
+            "- Character movement\n\n"
+            "Only sync changes that are CLEARLY stated in the narrative and were NOT already "
+            "handled by the GM's tool calls.\n\n"
+            "If no state changes need syncing, respond with 'No state changes to sync.'"
+        )
+    ))
+    
+    logger.info(f"[accountant_init] GM made {len(gm_tool_calls)} tool calls")
+    
+    return {"accountant_messages": accountant_messages}
+
+
+def scribe_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for Scribe agent."""
+    world_id = state.get("world_id")
+    world_context = state.get("world_context")
+    events_context = state.get("events_context")
+    messages = list(state.get("messages", []))
+    history_count = state.get("history_message_count", 0)
+    first_event_id = state.get("first_event_id", "")
+    last_event_id = state.get("last_event_id", "")
+    current_game_time = state.get("current_game_time", 0)
+    
+    logger.debug(f"[scribe_init] Building context for Scribe")
+    
+    # 1. System prompt
+    scribe_messages = [SystemMessage(content=SCRIBE_SYSTEM_PROMPT)]
+    
+    # 2. World ID for tool calls
+    if world_id:
+        scribe_messages.append(SystemMessage(
+            content=f"world_id for tool calls: {world_id}"
+        ))
+    
+    # 3. Context from BEFORE this turn (world state + previous events)
+    context_parts = []
+    
+    if world_context:
+        context_parts.append(f"WORLD STATE:\n{world_context}")
+    
+    if events_context:
+        context_parts.append(f"PREVIOUS EVENTS (already recorded, do not duplicate):\n{events_context}")
+    
+    if context_parts:
+        scribe_messages.append(SystemMessage(
+            content="=== CONTEXT FROM BEFORE THIS TURN ===\n\n" + "\n\n---\n\n".join(context_parts)
+        ))
+    
+    # 4. THIS TURN's content - extracted and formatted clearly
+    this_turn_content = _extract_this_turn_content(messages, history_count)
+    
+    scribe_messages.append(SystemMessage(
+        content=(
+            "=== THIS TURN (what just happened - record this) ===\n\n"
+            "The following is a transcript of the player's action and the GM's response. "
+            "This is NOT your communication - this is what you must record as events.\n\n"
+            f"{this_turn_content}"
+        )
+    ))
+    
+    # 5. Event IDs for chronicle linking and game time
+    event_count = len(json.loads(events_context)) if events_context else 0
+    logger.debug(f"[scribe_init] current_game_time={current_game_time}, event_count={event_count}")
+    
+    # Format game time for readability
+    days = current_game_time // 86400
+    remaining = current_game_time % 86400
+    hours = remaining // 3600
+    minutes = (remaining % 3600) // 60
+    time_str = f"Day {days + 1}, {hours:02d}:{minutes:02d}"
+    
+    chronicle_info = ""
+    if first_event_id and last_event_id:
+        chronicle_info = f"\n\nIf creating a chronicle: use start_event_id={first_event_id} and end_event_id={last_event_id} to link the {event_count} events."
+    
+    # 6. User message asking scribe to do its job
+    scribe_messages.append(HumanMessage(
+        content=(
+            f"**CURRENT GAME TIME: {current_game_time} seconds ({time_str})**\n\n"
+            f"Record events for this turn. Each event's game_time MUST be > {current_game_time}.\n"
+            f"Add estimated duration to current time (e.g., combat round +6s, dialogue +30-60s, travel +1800s).\n"
+            f"If 15+ previous events exist, consider creating a chronicle summary.{chronicle_info}"
+        )
+    ))
+    
+    logger.info(f"[scribe_init] Processing turn with {len(messages) - history_count} new messages")
+    
+    return {"scribe_messages": scribe_messages}
+
+
+def world_creator_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for World Creator agent."""
+    world_id = state.get("world_id")
+    world_context = state.get("world_context")
+    messages = list(state.get("messages", []))
+    
+    logger.debug(f"[world_creator_init] Building context for World Creator")
+    
+    # Build system messages with context
+    system_messages = [SystemMessage(content=WORLD_CREATOR_SYSTEM_PROMPT)]
+    
+    # Inject world context
+    if world_context:
+        world_ctx = SystemMessage(content=f"[WORLD STATE]\n{world_context}\n[END WORLD STATE]")
+        system_messages.append(world_ctx)
+    
+    # Inject world_id for tool calls
+    if world_id:
+        system_messages.append(SystemMessage(content=f"[WORLD ID]\nworld_id for all tool calls: {world_id}\n[END WORLD ID]"))
+    
+    # Combine with conversation
+    world_creator_messages = system_messages + messages
+    
+    return {"world_creator_messages": world_creator_messages}
+
+
+def char_creator_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for Character Creator agent."""
+    world_id = state.get("world_id")
+    world_context = state.get("world_context")
+    messages = list(state.get("messages", []))
+    
+    logger.debug(f"[char_creator_init] Building context for Character Creator")
+    
+    # Build system messages with context
+    system_messages = [SystemMessage(content=CHAR_CREATOR_SYSTEM_PROMPT)]
+    
+    # Inject world context (includes character info)
+    if world_context:
+        world_ctx = SystemMessage(content=f"[WORLD STATE]\n{world_context}\n[END WORLD STATE]")
+        system_messages.append(world_ctx)
+    
+    # Inject world_id for tool calls
+    if world_id:
+        system_messages.append(SystemMessage(content=f"[WORLD ID]\nworld_id for all tool calls: {world_id}\n[END WORLD ID]"))
+    
+    # Combine with conversation
+    char_creator_messages = system_messages + messages
+    
+    return {"char_creator_messages": char_creator_messages}
 
 
 # ============================================================================
 # Routing Functions
 # ============================================================================
 
-def should_continue_gm(state: GMAgentState) -> Literal["gm_tools", "capture_response"]:
-    """Route from GM agent to tools or capture response."""
-    messages = state.get("messages", [])
+def route_entry(state: GMAgentState) -> Literal["world_creator", "char_creator", "historian"]:
+    """Route from load_context to the appropriate agent based on creation flags."""
+    if state.get("creation_in_progress", False):
+        logger.info("[route_entry] creation_in_progress=True -> world_creator")
+        return "world_creator"
+    if state.get("needs_character_creation", False):
+        logger.info("[route_entry] needs_character_creation=True -> char_creator")
+        return "char_creator"
+    logger.debug("[route_entry] -> historian (normal gameplay)")
+    return "historian"
+
+
+def should_continue_world_creator(state: GMAgentState) -> Literal["world_creator_tools", "persist_response"]:
+    """Route from world_creator agent to tools or persist response."""
+    messages = state.get("world_creator_messages", [])
     last_message = messages[-1] if messages else None
     
     if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
         tool_names = [tc["name"] for tc in last_message.tool_calls]
-        logger.info(f"[GM] Routing to tools: {tool_names}")
-        return "gm_tools"
+        logger.info(f"[World Creator] Routing to tools: {tool_names}")
+        return "world_creator_tools"
     
+    logger.info("[World Creator] Response complete, persisting")
+    return "persist_response"
+
+
+def should_continue_char_creator(state: GMAgentState) -> Literal["char_creator_tools", "persist_response"]:
+    """Route from char_creator agent to tools or persist response."""
+    messages = state.get("char_creator_messages", [])
+    last_message = messages[-1] if messages else None
+    
+    if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        tool_names = [tc["name"] for tc in last_message.tool_calls]
+        logger.info(f"[Char Creator] Routing to tools: {tool_names}")
+        return "char_creator_tools"
+    
+    logger.info("[Char Creator] Response complete, persisting")
+    return "persist_response"
+
+
+def should_continue_historian(state: GMAgentState) -> Literal["historian_tools", "compile_historian"]:
+    """Route from Historian agent to tools or compile context."""
+    messages = state.get("historian_messages", [])
+    last_message = messages[-1] if messages else None
+
+    if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        tool_names = [tc["name"] for tc in last_message.tool_calls]
+        logger.info(f"[Historian] Routing to tools: {tool_names}")
+        logger.debug(f"[should_continue_historian] -> historian_tools")
+        return "historian_tools"
+
+    logger.info("[Historian] No tool calls, compiling context")
+    logger.debug(f"[should_continue_historian] -> compile_historian")
+    return "compile_historian"
+
+
+def should_continue_bard(state: GMAgentState) -> Literal["bard_tools", "accountant"]:
+    """Route from Bard agent to tools or accountant."""
+    messages = state.get("bard_messages", [])
+    last_message = messages[-1] if messages else None
+
+    if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        tool_names = [tc["name"] for tc in last_message.tool_calls]
+        logger.info(f"[Bard] Routing to tools: {tool_names}")
+        logger.debug(f"[should_continue_bard] -> bard_tools")
+        return "bard_tools"
+
+    logger.info("[Bard] No entities to record, routing to accountant")
+    logger.debug(f"[should_continue_bard] -> accountant")
+    return "accountant"
+
+
+def should_continue_gm(state: GMAgentState) -> Literal["gm_tools", "capture_response"]:
+    """Route from GM agent to tools or capture response."""
+    messages = state.get("gm_messages", [])
+    last_message = messages[-1] if messages else None
+
+    if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        tool_names = [tc["name"] for tc in last_message.tool_calls]
+        logger.info(f"[GM] Routing to tools: {tool_names}")
+        logger.debug(f"[should_continue_gm] -> gm_tools")
+        return "gm_tools"
+
     logger.info("[GM] Response complete, capturing response")
+    logger.debug(f"[should_continue_gm] -> capture_response")
     return "capture_response"
+
+
+def should_continue_accountant(state: GMAgentState) -> Literal["accountant_tools", "scribe"]:
+    """Route from Accountant agent to tools or scribe."""
+    messages = state.get("accountant_messages", [])
+    last_message = messages[-1] if messages else None
+    
+    if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        tool_names = [tc["name"] for tc in last_message.tool_calls]
+        logger.info(f"[Accountant] Routing to tools: {tool_names}")
+        logger.debug(f"[should_continue_accountant] -> accountant_tools")
+        return "accountant_tools"
+    
+    logger.info("[Accountant] No state changes, routing to scribe")
+    logger.debug(f"[should_continue_accountant] -> scribe")
+    return "scribe"
 
 
 def should_continue_scribe(state: GMAgentState) -> Literal["scribe_tools", "cleanup"]:
     """Route from Scribe agent to tools or cleanup."""
-    messages = state.get("messages", [])
+    messages = state.get("scribe_messages", [])
     last_message = messages[-1] if messages else None
     
     if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
         tool_names = [tc["name"] for tc in last_message.tool_calls]
         logger.info(f"[Scribe] Routing to tools: {tool_names}")
+        logger.debug(f"[should_continue_scribe] -> scribe_tools")
         return "scribe_tools"
     
     logger.info("[Scribe] Complete, routing to cleanup")
+    logger.debug(f"[should_continue_scribe] -> cleanup")
     return "cleanup"
 
 
 # ============================================================================
-# Node: Cleanup Activity
+# Node: World Creator Agent (for world creation phase)
 # ============================================================================
 
-async def create_cleanup_node(db):
-    """Create the cleanup node that deletes activity records."""
+def create_world_creator_agent_node(llm_with_tools, db):
+    """Create the World Creator agent node for conversational world building."""
     
-    async def cleanup_node(state: GMAgentState) -> dict[str, Any]:
-        """Delete all agent activity records for this world after the turn completes."""
+    async def world_creator_agent_node(state: GMAgentState) -> dict[str, Any]:
+        """Run the world creator agent for this turn."""
+        messages = list(state.get("world_creator_messages", []))
         world_id = state.get("world_id")
         
-        if world_id:
-            try:
-                result = await db.agent_activity.delete_many({"world_id": world_id})
-                logger.info(f"[Cleanup] Deleted {result.deleted_count} activity records for world {world_id}")
-            except Exception as e:
-                logger.warning(f"[Cleanup] Failed to delete activity records: {e}")
+        logger.info(f"[World Creator] Running for world {world_id}")
         
-        # Return empty dict - no state changes
+        logger.debug(f"[world_creator] Invoking with {len(messages)} messages")
+        
+        # Invoke LLM
+        response = await llm_with_tools.ainvoke(messages)
+        
+        tool_calls = getattr(response, "tool_calls", None) or []
+        logger.debug(f"[world_creator] tool_calls={[tc['name'] for tc in tool_calls]}, content_len={len(response.content or '')}")
+        
+        return {"world_creator_messages": [response]}
+    
+    return world_creator_agent_node
+
+
+# ============================================================================
+# Node: Character Creator Agent (for character creation phase)
+# ============================================================================
+
+def create_char_creator_agent_node(llm_with_tools, db):
+    """Create the Character Creator agent node for conversational character building."""
+    
+    async def char_creator_agent_node(state: GMAgentState) -> dict[str, Any]:
+        """Run the character creator agent for this turn."""
+        messages = list(state.get("char_creator_messages", []))
+        world_id = state.get("world_id")
+        
+        logger.info(f"[Char Creator] Running for world {world_id}")
+        
+        logger.debug(f"[char_creator] Invoking with {len(messages)} messages")
+        
+        # Invoke LLM
+        response = await llm_with_tools.ainvoke(messages)
+        
+        tool_calls = getattr(response, "tool_calls", None) or []
+        logger.debug(f"[char_creator] tool_calls={[tc['name'] for tc in tool_calls]}, content_len={len(response.content or '')}")
+        
+        return {"char_creator_messages": [response]}
+    
+    return char_creator_agent_node
+
+
+# ============================================================================
+# Node: Persist Response (for creation paths)
+# ============================================================================
+
+def persist_response_node(state: GMAgentState) -> dict[str, Any]:
+    """Grab the last AIMessage content and persist it as gm_final_response (for creation paths)."""
+    # Check both world_creator_messages and char_creator_messages
+    world_creator_messages = state.get("world_creator_messages", [])
+    char_creator_messages = state.get("char_creator_messages", [])
+    
+    # Use whichever is populated
+    messages = world_creator_messages if world_creator_messages else char_creator_messages
+    
+    # Find the last AI response (not tool calls)
+    gm_response = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            if not (hasattr(msg, "tool_calls") and msg.tool_calls):
+                gm_response = msg.content
+                break
+    
+    logger.info(f"[persist_response] Captured response: {gm_response[:100] if gm_response else '(empty)'}...")
+    
+    return {"gm_final_response": gm_response}
+
+
+# ============================================================================
+# Node: Debug State Logger
+# ============================================================================
+
+def debug_state_logger_node(state: GMAgentState) -> dict[str, Any]:
+    """Log the complete state at the end of a turn for debugging purposes.
+    
+    Only logs if DEBUG environment variable is set to true.
+    """
+    if not DEBUG:
         return {}
     
-    return cleanup_node
+    world_id = state.get("world_id", "unknown")
+    
+    logger.debug("=" * 80)
+    logger.debug(f"[DEBUG STATE] Final state for world {world_id}")
+    logger.debug("=" * 80)
+    
+    # Log state field by field for readability
+    for key, value in state.items():
+        if key.endswith("_messages"):
+            # For agent-specific message lists, log with smart truncation
+            msg_list = value if isinstance(value, list) else []
+            msg_types = [type(m).__name__ for m in msg_list]
+            logger.debug(f"\n{key}: {len(msg_list)} messages - {msg_types}")
+            
+            # Log each message with appropriate detail level
+            for i, msg in enumerate(msg_list):
+                msg_type = type(msg).__name__
+                
+                if isinstance(msg, SystemMessage):
+                    # System messages: heavily truncated (just first 100 chars)
+                    content = str(msg.content) if hasattr(msg, "content") else ""
+                    preview = content[:100] + "..." if len(content) > 100 else content
+                    logger.debug(f"  [{i}] SystemMessage: {preview}")
+                
+                elif isinstance(msg, AIMessage):
+                    # AI messages: show moderate content + FULL tool calls
+                    content = str(msg.content) if hasattr(msg, "content") else ""
+                    content_preview = content[:300] + "..." if len(content) > 300 else content
+                    logger.debug(f"  [{i}] AIMessage: {content_preview}")
+                    
+                    # Show FULL tool calls
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        logger.debug(f"      Tool Calls ({len(msg.tool_calls)}):")
+                        for tc in msg.tool_calls:
+                            logger.debug(f"        - {tc.get('name')}({json.dumps(tc.get('args', {}), indent=10)})")
+                
+                elif isinstance(msg, ToolMessage):
+                    # Tool messages: show FULL content (these are results we need to see)
+                    content = str(msg.content) if hasattr(msg, "content") else ""
+                    tool_name = getattr(msg, "name", "unknown")
+                    logger.debug(f"  [{i}] ToolMessage [{tool_name}]:")
+                    logger.debug(f"      {content}")
+                
+                elif isinstance(msg, HumanMessage):
+                    # Human messages: moderate truncation
+                    content = str(msg.content) if hasattr(msg, "content") else ""
+                    preview = content[:200] + "..." if len(content) > 200 else content
+                    logger.debug(f"  [{i}] HumanMessage: {preview}")
+                
+                else:
+                    # Unknown message type
+                    logger.debug(f"  [{i}] {msg_type}: {str(msg)[:100]}")
+        
+        elif key == "messages":
+            # Global conversation history - show only latest user and GM messages
+            msg_list = value if isinstance(value, list) else []
+            logger.debug(f"\n{key}: {len(msg_list)} conversation messages (showing last 2)")
+            
+            # Get last user message (HumanMessage)
+            last_user = None
+            last_gm = None
+            for msg in reversed(msg_list):
+                if isinstance(msg, HumanMessage) and last_user is None:
+                    last_user = msg
+                elif isinstance(msg, AIMessage) and last_gm is None:
+                    last_gm = msg
+                if last_user and last_gm:
+                    break
+            
+            if last_user:
+                content = str(last_user.content) if hasattr(last_user, "content") else ""
+                logger.debug(f"  [LAST USER]: {content}")
+            
+            if last_gm:
+                content = str(last_gm.content) if hasattr(last_gm, "content") else ""
+                logger.debug(f"  [LAST GM]: {content}")
+        
+        elif key in ["world_context", "events_context", "enriched_context"]:
+            # Long context strings - log length only
+            value_str = str(value) if value else ""
+            logger.debug(f"\n{key}: {len(value_str)} chars")
+        
+        elif key in ["gm_final_response"]:
+            # Response text - log full (this is what gets saved)
+            value_str = str(value) if value else ""
+            logger.debug(f"\n{key}: {value_str}")
+        
+        elif key == "gm_tool_calls":
+            # Tool calls list - show full details
+            tool_calls = value if isinstance(value, list) else []
+            logger.debug(f"\n{key}: {len(tool_calls)} calls")
+            for tc in tool_calls:
+                logger.debug(f"  - {tc.get('name')}({json.dumps(tc.get('args', {}), indent=6)})")
+        
+        else:
+            # Simple fields - log as-is
+            logger.debug(f"\n{key}: {value}")
+    
+    logger.debug("=" * 80)
+    
+    # Return empty dict - no state changes
+    return {}
 
 
 # ============================================================================
@@ -665,19 +1259,25 @@ async def create_gm_agent(
 ) -> tuple[StateGraph, dict]:
     """
     Create the GM agent graph with separated concerns.
-    
+
     Flow:
-    load_context -> gm_agent <-> gm_tools -> capture_response -> scribe -> scribe_tools -> cleanup -> END
+    load_context -> ... -> bard <-> bard_tools -> (creation_in_progress ? debug_state : accountant -> ... -> debug_state) -> END
+
+    Agent Responsibilities:
+    - Historian: Read-only search to enrich context (lore, characters, locations, events)
+    - Bard: Record new entities from GM narrative (NPCs, locations, lore, factions)
+    - GM: Narration, dice rolls, combat management, quest/world updates, character creation
+    - Accountant: State sync (damage, healing, status effects, movement, items)
+    - Scribe: Event recording and chronicle creation
     
-    Note: The Scribe does NOT loop back after tools execute (no scribe_tools -> scribe edge).
-    This prevents duplicate event recording if rate limiting causes LLM retries.
-    The Scribe can record events + chronicles in a single batch of tool calls.
+    Note: Neither Accountant nor Scribe loop back after tools execute.
+    This prevents duplicate operations if rate limiting causes LLM retries.
+    Each can complete their work in a single batch of tool calls.
     
-    The capture_response node stores the GM's final response in state.gm_final_response
-    before the scribe runs. This ensures the GM's response is preserved separately
-    from any scribe messages.
+    The capture_response node stores the GM's final response and tool calls
+    so the Accountant knows what state changes were already persisted.
     
-    The cleanup node deletes all agent_activity records for this world.
+    The debug_state node logs the full state at the end of each turn (if DEBUG=true).
     
     Args:
         db: MongoDB database connection
@@ -695,51 +1295,212 @@ async def create_gm_agent(
     
     # Get all MCP tools
     all_tools = await get_mcp_tools(mcp_url)
-    
+
+    # =========================================================================
+    # Tool Separation: Historian (read-only) | Bard (entity creation) | GM | Accountant | Scribe
+    # =========================================================================
+
+    # Historian tools (read-only search)
+    historian_tool_names = {
+        "search_lore", "find_characters", "find_locations", "search_locations", "find_events",
+        "find_quests", "find_factions", "get_entity", "get_chronicle_details",
+        "get_location_contents", "find_nearby_locations", "get_character_inventory",
+    }
+    historian_tools = [t for t in all_tools if t.name in historian_tool_names]
+
+    # Bard tools (search + create/update entities)
+    bard_tool_names = {
+        # Search tools (check if entities exist before creating)
+        "find_characters",
+        # Create/update tools
+        "create_npc", "update_npc", "set_location",
+        "set_lore", "set_faction",
+    }
+    bard_tools = [t for t in all_tools if t.name in bard_tool_names]
+
+    # World Creator tools (world-building only, NPC-specific tools)
+    world_creator_tool_names = {
+        # Search/query
+        "search_lore", "find_characters", "find_locations", "find_events",
+        "find_quests", "find_factions", "get_entity", "get_location_contents", "find_nearby_locations",
+        # Create/record (NPCs, locations, factions, lore)
+        "set_lore", "set_location", "set_faction",
+        "create_npc", "update_npc", "spawn_enemies",  # NPC-specific tools
+        "set_item_blueprint", "set_ability_blueprint",
+        # World basics
+        "update_world_basics", "start_game",
+        # Dice/random
+        "roll_table", "coin_flip",
+    }
+    world_creator_tools = [t for t in all_tools if t.name in world_creator_tool_names]
+
+    # Character Creator tools (PC-specific tools for stats + finalize)
+    char_creator_tool_names = {
+        # Update PC
+        "update_pc_basics", "set_attributes", "set_skills", "grant_abilities",
+        # Finalize
+        "finalize_character",
+        # Dice
+        "roll_dice", "roll_stat_array", "roll_table",
+        # Search
+        "search_lore", "find_locations", "get_entity",
+    }
+    char_creator_tools = [t for t in all_tools if t.name in char_creator_tool_names]
+
     # Scribe-only tools (event and chronicle management)
     scribe_tool_names = {"record_event", "set_chronicle"}
     scribe_tools = [t for t in all_tools if t.name in scribe_tool_names]
-    
-    # Tools to exclude from GM (scribe tools + deprecated/unnecessary tools)
-    gm_excluded_tools = scribe_tool_names | {"load_session"}  # load_session not needed - context is pre-loaded
-    
-    # GM tools = all tools EXCEPT excluded tools
-    # The GM focuses on gameplay; the Scribe handles record-keeping
-    gm_tools = [t for t in all_tools if t.name not in gm_excluded_tools]
-    
-    logger.info(f"Loaded {len(gm_tools)} GM tools, {len(scribe_tools)} scribe tools (separated)")
-    
+
+    # Accountant tools (state sync - damage, healing, status, movement, items)
+    accountant_tool_names = {
+        # Character state
+        "deal_damage", "heal", "apply_statuses", "remove_status",
+        "set_attributes", "set_skills", "set_level",
+        "grant_abilities", "revoke_ability",
+        # Movement
+        "move_character",
+        # Items
+        "give_item", "drop_item", "set_item_quantity", "spawn_item", "destroy_item",
+        "set_item_attribute", "apply_item_status", "remove_item_status",
+    }
+    accountant_tools = [t for t in all_tools if t.name in accountant_tool_names]
+
+    # GM gets dice + encounters. Context is pre-loaded; Bard/Accountant/Scribe handle state.
+    # World creation and character creation are handled by dedicated agents upstream.
+    gm_tool_names = {
+        "roll_dice", "roll_table", "coin_flip", "roll_stat_array", "percentile_roll",
+        "start_encounter", "get_encounter", "get_active_encounter",
+        "add_combatant", "set_initiative", "remove_combatant", "next_turn", "end_encounter",
+    }
+    gm_tools = [t for t in all_tools if t.name in gm_tool_names]
+
+    logger.info(f"Tool separation: {len(historian_tools)} Historian, {len(bard_tools)} Bard, {len(gm_tools)} GM, {len(accountant_tools)} Accountant, {len(scribe_tools)} Scribe, {len(world_creator_tools)} WorldCreator, {len(char_creator_tools)} CharCreator")
+
+    # Create LLMs with different temperatures
+    historian_llm = get_llm(provider, model, temperature=0.3)
+    bard_llm = get_llm(provider, model, temperature=0.3)
+    accountant_llm = get_llm(provider, model, temperature=0.3)
+
     # Bind tools to LLMs
+    historian_llm_with_tools = historian_llm.bind_tools(historian_tools)
+    bard_llm_with_tools = bard_llm.bind_tools(bard_tools)
     gm_llm_with_tools = gm_llm.bind_tools(gm_tools)
+    accountant_llm_with_tools = accountant_llm.bind_tools(accountant_tools)
     scribe_llm_with_tools = scribe_llm.bind_tools(scribe_tools)
+    world_creator_llm = get_llm(provider, model, temperature=0.7)
+    world_creator_llm_with_tools = world_creator_llm.bind_tools(world_creator_tools)
+    char_creator_llm = get_llm(provider, model, temperature=0.7)
+    char_creator_llm_with_tools = char_creator_llm.bind_tools(char_creator_tools)
     
-    # Create nodes (pass db for activity logging)
+    # Create nodes
     load_context_node = await create_load_context_node(db)
+    historian_agent_node = create_historian_agent_node(historian_llm_with_tools, db)
+    historian_tools_node = create_logging_tool_node(historian_tools, db, "Historian", "historian_messages")
     gm_agent_node = create_gm_agent_node(gm_llm_with_tools, db)
-    gm_tools_node = create_logging_tool_node(gm_tools, db, "GM")
+    gm_tools_node = create_logging_tool_node(gm_tools, db, "GM", "gm_messages")
+    accountant_agent_node = create_accountant_agent_node(accountant_llm_with_tools, db)
+    accountant_tools_node = create_logging_tool_node(accountant_tools, db, "Accountant", "accountant_messages")
+    bard_agent_node = create_bard_agent_node(bard_llm_with_tools, db)
+    bard_tools_node = create_logging_tool_node(bard_tools, db, "Bard", "bard_messages")
     scribe_agent_node = create_scribe_agent_node(scribe_llm_with_tools, db)
-    scribe_tools_node = create_logging_tool_node(scribe_tools, db, "Scribe")
-    cleanup_node = await create_cleanup_node(db)
-    
+    scribe_tools_node = create_logging_tool_node(scribe_tools, db, "Scribe", "scribe_messages")
+    world_creator_agent_node = create_world_creator_agent_node(world_creator_llm_with_tools, db)
+    world_creator_tools_node = create_logging_tool_node(world_creator_tools, db, "WorldCreator", "world_creator_messages")
+    char_creator_agent_node = create_char_creator_agent_node(char_creator_llm_with_tools, db)
+    char_creator_tools_node = create_logging_tool_node(char_creator_tools, db, "CharCreator", "char_creator_messages")
+
     # Build the graph
     workflow = StateGraph(GMAgentState)
-    
+
     # Add nodes
     workflow.add_node("load_context", load_context_node)
+    
+    # Init nodes
+    workflow.add_node("historian_init", historian_init_node)
+    workflow.add_node("gm_init", gm_init_node)
+    workflow.add_node("bard_init", bard_init_node)
+    workflow.add_node("accountant_init", accountant_init_node)
+    workflow.add_node("scribe_init", scribe_init_node)
+    workflow.add_node("world_creator_init", world_creator_init_node)
+    workflow.add_node("char_creator_init", char_creator_init_node)
+    
+    # Agent nodes
+    workflow.add_node("historian", historian_agent_node)
+    workflow.add_node("historian_tools", historian_tools_node)
+    workflow.add_node("compile_historian", compile_historian_context_node)
     workflow.add_node("gm_agent", gm_agent_node)
     workflow.add_node("gm_tools", gm_tools_node)
     workflow.add_node("capture_response", capture_gm_response_node)
+    workflow.add_node("bard", bard_agent_node)
+    workflow.add_node("bard_tools", bard_tools_node)
+    workflow.add_node("accountant", accountant_agent_node)
+    workflow.add_node("accountant_tools", accountant_tools_node)
     workflow.add_node("scribe", scribe_agent_node)
     workflow.add_node("scribe_tools", scribe_tools_node)
-    workflow.add_node("cleanup", cleanup_node)
-    
+    workflow.add_node("world_creator", world_creator_agent_node)
+    workflow.add_node("world_creator_tools", world_creator_tools_node)
+    workflow.add_node("char_creator", char_creator_agent_node)
+    workflow.add_node("char_creator_tools", char_creator_tools_node)
+    workflow.add_node("persist_response", persist_response_node)
+    workflow.add_node("debug_state", debug_state_logger_node)
+
     # Set entry point
     workflow.set_entry_point("load_context")
-    
+
     # Add edges
-    # Flow: load_context -> gm_agent <-> gm_tools -> capture_response -> scribe -> scribe_tools -> cleanup -> END
-    workflow.add_edge("load_context", "gm_agent")
+    # Flow: load_context -> route_entry -> (world_creator_init | char_creator_init | historian_init) -> ...
+    workflow.add_conditional_edges(
+        "load_context",
+        route_entry,
+        {
+            "world_creator": "world_creator_init",
+            "char_creator": "char_creator_init",
+            "historian": "historian_init",
+        }
+    )
     
+    # World creator path: world_creator_init -> world_creator <-> world_creator_tools -> persist_response -> END
+    workflow.add_edge("world_creator_init", "world_creator")
+    workflow.add_conditional_edges(
+        "world_creator",
+        should_continue_world_creator,
+        {
+            "world_creator_tools": "world_creator_tools",
+            "persist_response": "persist_response",
+        }
+    )
+    workflow.add_edge("world_creator_tools", "world_creator")
+    
+    # Char creator path: char_creator_init -> char_creator <-> char_creator_tools -> persist_response -> END
+    workflow.add_edge("char_creator_init", "char_creator")
+    workflow.add_conditional_edges(
+        "char_creator",
+        should_continue_char_creator,
+        {
+            "char_creator_tools": "char_creator_tools",
+            "persist_response": "persist_response",
+        }
+    )
+    workflow.add_edge("char_creator_tools", "char_creator")
+    
+    # Persist response -> debug_state -> END (for creation paths)
+    workflow.add_edge("persist_response", "debug_state")
+    
+    # Normal gameplay path: historian_init -> historian <-> historian_tools -> compile_historian -> gm_init -> gm_agent -> ...
+    workflow.add_edge("historian_init", "historian")
+    workflow.add_conditional_edges(
+        "historian",
+        should_continue_historian,
+        {
+            "historian_tools": "historian_tools",
+            "compile_historian": "compile_historian",
+        }
+    )
+    workflow.add_edge("historian_tools", "historian")
+    workflow.add_edge("compile_historian", "gm_init")
+    
+    # GM path: gm_init -> gm_agent <-> gm_tools -> capture_response -> bard_init -> bard -> ...
+    workflow.add_edge("gm_init", "gm_agent")
     workflow.add_conditional_edges(
         "gm_agent",
         should_continue_gm,
@@ -749,31 +1510,66 @@ async def create_gm_agent(
         }
     )
     workflow.add_edge("gm_tools", "gm_agent")
-    workflow.add_edge("capture_response", "scribe")
+
+    # After capturing response, go to bard_init
+    workflow.add_edge("capture_response", "bard_init")
     
+    # Bard path: bard_init -> bard <-> bard_tools -> accountant_init -> accountant -> ...
+    workflow.add_edge("bard_init", "bard")
+    workflow.add_conditional_edges(
+        "bard",
+        should_continue_bard,
+        {
+            "bard_tools": "bard_tools",
+            "accountant": "accountant_init",
+        }
+    )
+    # Bard tools loop back to bard for ReAct pattern (search -> create/update)
+    workflow.add_edge("bard_tools", "bard")
+    
+    # Accountant path: accountant_init -> accountant -> accountant_tools -> scribe_init -> scribe -> ...
+    workflow.add_edge("accountant_init", "accountant")
+    workflow.add_conditional_edges(
+        "accountant",
+        should_continue_accountant,
+        {
+            "accountant_tools": "accountant_tools",
+            "scribe": "scribe_init",
+        }
+    )
+    # NOTE: Accountant tools go directly to scribe_init (no loop back to accountant)
+    # This prevents duplicate state sync if rate limiting causes retries
+    # The Accountant can sync all state changes in a single batch of tool calls
+    workflow.add_edge("accountant_tools", "scribe_init")
+    
+    # Scribe path: scribe_init -> scribe -> scribe_tools -> debug_state -> END
+    workflow.add_edge("scribe_init", "scribe")
     workflow.add_conditional_edges(
         "scribe",
         should_continue_scribe,
         {
             "scribe_tools": "scribe_tools",
-            "cleanup": "cleanup",
+            "cleanup": "debug_state",
         }
     )
-    # NOTE: Scribe tools go directly to cleanup (no loop back to scribe)
+    # NOTE: Scribe tools go directly to debug_state (no loop back to scribe)
     # This prevents duplicate event recording if rate limiting causes retries
     # The Scribe can record events + chronicles in a single batch of tool calls
-    workflow.add_edge("scribe_tools", "cleanup")
-    workflow.add_edge("cleanup", END)
+    workflow.add_edge("scribe_tools", "debug_state")
+    
+    # All paths converge at debug_state -> END
+    workflow.add_edge("debug_state", END)
     
     # Compile
     graph = workflow.compile()
-    logger.info("Compiled GM agent graph: load_context -> gm_agent <-> gm_tools -> capture_response -> scribe -> scribe_tools -> cleanup")
+    logger.info("Compiled GM agent graph: load_context -> ... -> bard -> (creation_in_progress? debug_state : accountant -> scribe -> debug_state)")
     
     config = {
         "provider": provider,
         "model": model or ("claude-haiku-4-5-20251001" if provider == "anthropic" else "gpt-4o"),
         "mcp_url": mcp_url,
         "gm_tools_count": len(gm_tools),
+        "accountant_tools_count": len(accountant_tools),
         "scribe_tools_count": len(scribe_tools),
     }
     
@@ -862,6 +1658,7 @@ class GMAgent:
         message: str,
         world_id: str,
         history: list[dict] | None = None,
+        needs_character_creation: bool = False,
     ):
         """
         Stream responses from the GM.
@@ -876,6 +1673,7 @@ class GMAgent:
             world_id: World ID for context loading
             history: Recent conversation history as list of dicts:
                      [{"role": "player"|"gm", "content": "...", "character_name": "..."}]
+            needs_character_creation: If True, route to character creator agent
         
         Yields:
             Events as they occur (tool calls, responses, etc.)
@@ -907,6 +1705,7 @@ class GMAgent:
             "world_id": world_id,
             "messages": messages,
             "history_message_count": history_message_count,
+            "needs_character_creation": needs_character_creation,
         }
         
         logger.info(f"Running agent with {len(messages)} messages (history={len(history) if history else 0})")

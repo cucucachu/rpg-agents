@@ -30,8 +30,7 @@ from langchain_core.messages import ToolMessage
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/worlds", tags=["messages"])
 
-# Static message for users without a character - referenced in GM prompt
-NEW_PLAYER_MESSAGE = "NEW_PLAYER_JOINING: I am a new player joining this world. Please help me create a character."
+# Removed: NEW_PLAYER_MESSAGE - character creation now handled by dedicated agent
 
 # ============================================================================
 # Per-World Lock Management
@@ -162,29 +161,10 @@ class AgentResult:
         self.created_character_ids = created_character_ids
 
 
-def extract_created_character_ids(messages: list) -> list[str]:
-    """Extract character IDs from create_character tool results."""
-    character_ids = []
-    
-    for msg in messages:
-        if isinstance(msg, ToolMessage) and msg.name == "create_character":
-            # Tool result format: "Created character: {json}"
-            content = msg.content
-            if content and "Created character:" in content:
-                try:
-                    # Extract JSON part after "Created character: "
-                    json_str = content.split("Created character: ", 1)[1]
-                    char_data = json.loads(json_str)
-                    if char_data.get("id") and char_data.get("is_player_character"):
-                        character_ids.append(char_data["id"])
-                        logger.info(f"Found created PC: {char_data['id']} ({char_data.get('name', 'unknown')})")
-                except (json.JSONDecodeError, IndexError, KeyError) as e:
-                    logger.warning(f"Failed to parse create_character result: {e}")
-    
-    return character_ids
+# Removed: extract_created_character_ids - PCs are now created deterministically at world create/join time
 
 
-async def run_agent(world_id: str, user_message: str, character_name: str, db) -> AgentResult:
+async def run_agent(world_id: str, user_message: str, character_name: str, needs_character_creation: bool, db) -> AgentResult:
     """Run the GM agent and return the response.
     
     The agent graph now handles context loading deterministically:
@@ -195,9 +175,6 @@ async def run_agent(world_id: str, user_message: str, character_name: str, db) -
     After the GM agent responds, a Scribe agent records events and chronicles.
     The GM's final response is captured in state.gm_final_response before the
     scribe runs, ensuring we persist the correct message.
-    
-    Agent activity is logged to the agent_activity collection and can be
-    streamed via the /activity/stream endpoint.
     
     Returns:
         AgentResult with response_text and list of created player character IDs
@@ -226,20 +203,14 @@ async def run_agent(world_id: str, user_message: str, character_name: str, db) -
         message=formatted_message,
         world_id=world_id,
         history=recent_messages,
+        needs_character_creation=needs_character_creation,
     ):
         # Keep track of the final state
         final_state = event
     
-    # Extract created character IDs from tool messages
-    created_character_ids = []
-    
     # Get the GM's response from the captured state field
     if final_state:
         response_text = final_state.get("gm_final_response", "")
-        
-        # Extract any created player characters from tool results
-        messages = final_state.get("messages", [])
-        created_character_ids = extract_created_character_ids(messages)
         
         # Fallback: if gm_final_response wasn't captured, try to find it in messages
         if not response_text:
@@ -252,7 +223,7 @@ async def run_agent(world_id: str, user_message: str, character_name: str, db) -
                             response_text = content
                             break
     
-    return AgentResult(response_text=response_text, created_character_ids=created_character_ids)
+    return AgentResult(response_text=response_text, created_character_ids=[])
 
 
 # ============================================================================
@@ -313,19 +284,22 @@ async def send_message(
             broadcaster = get_broadcaster()
             
             try:
-                # Check if user has a character assigned
-                has_character = bool(access.get("character_id"))
+                # Check if user needs character creation
+                character_id = access.get("character_id")
+                needs_character_creation = False
+                if character_id:
+                    # Look up character to check creation_in_progress
+                    char_doc = await db.characters.find_one({"_id": ObjectId(character_id)})
+                    if char_doc and char_doc.get("creation_in_progress", False):
+                        needs_character_creation = True
+                        logger.info(f"User {user_id} character {character_id} has creation_in_progress=True")
+                else:
+                    # No character linked (shouldn't happen with new flow, but handle gracefully)
+                    needs_character_creation = True
+                    logger.warning(f"User {user_id} has no character_id in world {world_id}")
                 
                 # Get character name for this user
                 character_name = await get_user_character_name(db, user_id, world_id)
-                
-                # Determine the message to send to the agent
-                # If user has no character, substitute with the new player message
-                if has_character:
-                    agent_message = request.content
-                else:
-                    agent_message = NEW_PLAYER_MESSAGE
-                    logger.info(f"User {user_id} has no character in world {world_id}, triggering character creation flow")
                 
                 # Track who holds the lock and broadcast processing started
                 _world_lock_holder[world_id] = {
@@ -352,37 +326,16 @@ async def send_message(
                 
                 logger.info(f"Saved user message {user_msg.id} in world {world_id}")
                 
-                # Run the agent (with substituted message if no character)
+                # Run the agent
                 try:
                     agent_result = await run_agent(
                         world_id=world_id,
-                        user_message=agent_message,
+                        user_message=request.content,
                         character_name=character_name,
+                        needs_character_creation=needs_character_creation,
                         db=db,
                     )
                     gm_response = agent_result.response_text
-                    
-                    # If user had no character and one was created, link them
-                    if not has_character and agent_result.created_character_ids:
-                        # Link the first created PC to this user
-                        new_char_id = agent_result.created_character_ids[0]
-                        await db.world_access.update_one(
-                            {"user_id": user_id, "world_id": world_id},
-                            {"$set": {"character_id": new_char_id}}
-                        )
-                        logger.info(f"Linked user {user_id} to character {new_char_id} in world {world_id}")
-                        
-                        # Update character_name for the response (it was "Player" or display_name before)
-                        char_doc = await db.characters.find_one({"_id": ObjectId(new_char_id)})
-                        if char_doc:
-                            character_name = char_doc.get("name", character_name)
-                            # Update the user message we already saved with the correct character name
-                            await db.messages.update_one(
-                                {"_id": ObjectId(user_msg.id)},
-                                {"$set": {"character_name": character_name}}
-                            )
-                            user_msg.character_name = character_name
-                            logger.info(f"Updated message {user_msg.id} with character name: {character_name}")
                             
                 except Exception as e:
                     logger.error(f"Agent error: {e}")
