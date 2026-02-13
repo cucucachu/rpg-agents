@@ -38,7 +38,7 @@ substitutions:
   _REGION: us-central1
   _REPO: rpg
   _MCP_URL: https://rpg-mcp-f5ucpwjooa-uc.a.run.app
-  _ALLOWED_ORIGINS: https://conjurerstable.com,https://www.conjurerstable.com
+  _ALLOWED_ORIGINS: https://conjurerstable.com
 
 options:
   logging: CLOUD_LOGGING_ONLY
