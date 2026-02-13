@@ -32,7 +32,8 @@ steps:
       - --max-instances=5
       - --memory=1Gi
       - --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest,JWT_SECRET=jwt-secret:latest,MONGO_URL=mongodb-uri:latest
-      - --set-env-vars=MCP_URL=${_MCP_URL},MONGO_DB=rpg_mcp,LLM_PROVIDER=anthropic,LLM_MODEL=claude-haiku-4-5-20251001,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}
+      - --set-env-vars=MCP_URL=${_MCP_URL},MONGO_DB=rpg_mcp,LLM_PROVIDER=anthropic,LLM_MODEL=claude-haiku-4-5-20251001
+      - --set-env-vars=ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}
 
 substitutions:
   _REGION: us-central1
