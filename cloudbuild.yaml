@@ -17,23 +17,22 @@ steps:
 
   # Deploy to Cloud Run
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
-    entrypoint: gcloud
+    entrypoint: bash
     args:
-      - run
-      - deploy
-      - rpg-agents
-      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rpg-agents:$COMMIT_SHA
-      - --region=${_REGION}
-      - --platform=managed
-      - --allow-unauthenticated
-      - --port=8080
-      - --timeout=300
-      - --min-instances=1
-      - --max-instances=5
-      - --memory=1Gi
-      - --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest,JWT_SECRET=jwt-secret:latest,MONGO_URL=mongodb-uri:latest
-      - --set-env-vars=MCP_URL=${_MCP_URL},MONGO_DB=rpg_mcp,LLM_PROVIDER=anthropic,LLM_MODEL=claude-haiku-4-5-20251001
-      - --set-env-vars=ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}
+      - -c
+      - |
+        gcloud run deploy rpg-agents \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/rpg-agents:$COMMIT_SHA \
+          --region=${_REGION} \
+          --platform=managed \
+          --allow-unauthenticated \
+          --port=8080 \
+          --timeout=300 \
+          --min-instances=1 \
+          --max-instances=5 \
+          --memory=1Gi \
+          --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest,JWT_SECRET=jwt-secret:latest,MONGO_URL=mongodb-uri:latest \
+          --set-env-vars="MCP_URL=${_MCP_URL},MONGO_DB=rpg_mcp,LLM_PROVIDER=anthropic,LLM_MODEL=claude-haiku-4-5-20251001,ALLOWED_ORIGINS=${_ALLOWED_ORIGINS}"
 
 substitutions:
   _REGION: us-central1
