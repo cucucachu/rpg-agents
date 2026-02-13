@@ -17,6 +17,7 @@ from ..agent import create_gm_agent, GM_SYSTEM_PROMPT
 from ..agent.gm_agent import GMAgent
 from ..db import connect_db, close_db
 from . import auth, worlds, websocket as ws_module, messages as messages_module, events as events_module, updates as updates_module
+from .cors_config import CORS_CONFIG, print_cors_config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -77,13 +78,13 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     
-    # Add CORS middleware
+    # Add CORS middleware with production-safe configuration
+    logger.info("Configuring CORS middleware...")
+    print_cors_config()
+    
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        **CORS_CONFIG
     )
     
     # Mount routers

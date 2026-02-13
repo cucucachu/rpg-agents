@@ -28,3 +28,9 @@ htmlcov/
 
 # Docker
 .docker/
+
+# Secrets - Never commit these!
+invite_codes.txt
+*.pem
+*.key
+credentials.json
