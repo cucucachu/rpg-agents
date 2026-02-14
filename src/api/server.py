@@ -45,18 +45,17 @@ async def lifespan(app: FastAPI):
     logger.info(f"Initializing GM Agent with MCP_URL={mcp_url}, provider={provider}, model={model}")
     _agent = GMAgent(mcp_url=mcp_url, provider=provider, model=model)
     
+    # Set agent references BEFORE initialization so retry logic works
+    # if initialization fails (messages.py checks is_initialized and retries)
+    ws_module.set_gm_agent(_agent)
+    logger.info("GM Agent set for WebSocket handler")
+    messages_module.set_gm_agent(_agent)
+    logger.info("GM Agent set for messages module")
+    
     try:
         # Pass database connection for context loading
         await _agent.initialize(db)
         logger.info(f"GM Agent initialized with {_agent._config['gm_tools_count']} GM tools, {_agent._config['scribe_tools_count']} scribe tools")
-        
-        # Set agent reference for WebSocket handler (legacy)
-        ws_module.set_gm_agent(_agent)
-        logger.info("GM Agent set for WebSocket handler")
-        
-        # Set agent reference for messages module (new architecture)
-        messages_module.set_gm_agent(_agent)
-        logger.info("GM Agent set for messages module")
     except Exception as e:
         logger.error(f"Agent initialization failed: {e}")
         logger.error(traceback.format_exc())
