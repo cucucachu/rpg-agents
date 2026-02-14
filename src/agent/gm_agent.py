@@ -119,6 +119,9 @@ def get_llm(
     """Get the LLM based on provider."""
     if provider == "anthropic":
         model = model or "claude-haiku-4-5-20251001"
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        api_key_preview = f"{api_key[:8]}...{api_key[-4:]}" if len(api_key) > 12 else "(missing or short)"
+        logger.info(f"Creating ChatAnthropic: model={model}, api_key={api_key_preview}, key_length={len(api_key)}")
         return ChatAnthropic(
             model=model,
             temperature=temperature,
@@ -1064,13 +1067,17 @@ def create_world_creator_agent_node(llm_with_tools, db):
         
         logger.info(f"[World Creator] Running for world {world_id}")
         
-        logger.debug(f"[world_creator] Invoking with {len(messages)} messages")
+        logger.info(f"[world_creator] Invoking LLM with {len(messages)} messages")
         
         # Invoke LLM
-        response = await llm_with_tools.ainvoke(messages)
+        try:
+            response = await llm_with_tools.ainvoke(messages)
+        except Exception as e:
+            logger.exception(f"[world_creator] LLM invocation failed: {type(e).__name__}: {e}")
+            raise
         
         tool_calls = getattr(response, "tool_calls", None) or []
-        logger.debug(f"[world_creator] tool_calls={[tc['name'] for tc in tool_calls]}, content_len={len(response.content or '')}")
+        logger.info(f"[world_creator] LLM responded: tool_calls={[tc['name'] for tc in tool_calls]}, content_len={len(response.content or '')}")
         
         return {"world_creator_messages": [response]}
     

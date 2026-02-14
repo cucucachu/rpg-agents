@@ -338,7 +338,7 @@ async def send_message(
                     gm_response = agent_result.response_text
                             
                 except Exception as e:
-                    logger.error(f"Agent error: {e}")
+                    logger.exception(f"Agent error: {e}")
                     gm_response = f"[The GM encounters a moment of confusion...] (Error: {str(e)[:100]})"
                 
                 # Save GM message
