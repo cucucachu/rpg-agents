@@ -5,7 +5,7 @@ This module implements a clean separation between:
 - Agent Context: Minimal context for LLM reasoning (built fresh each call)
 
 Key endpoints:
-- POST /api/worlds/{world_id}/messages - Send message (blocking, with lock)
+- POST /api/worlds/{world_id}/messages - Send message (non-blocking, returns 202)
 - GET /api/worlds/{world_id}/messages/stream - SSE stream of new messages
 - GET /api/worlds/{world_id}/messages - Get message history
 """
@@ -16,7 +16,7 @@ import logging
 from datetime import datetime
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from bson import ObjectId
@@ -86,6 +86,7 @@ class SendMessageResponse(BaseModel):
     """Response from sending a message."""
     user_message: MessageResponse
     gm_message: MessageResponse | None = None
+    status: str = "processing"  # "processing" or "complete"
 
 
 class MessageHistoryResponse(BaseModel):
@@ -227,27 +228,130 @@ async def run_agent(world_id: str, user_message: str, character_name: str, needs
 
 
 # ============================================================================
+# Background Processing
+# ============================================================================
+
+async def process_message_background(
+    world_id: str,
+    user_id: str,
+    user_message_content: str,
+    character_name: str,
+    character_id: str | None,
+):
+    """
+    Background task to process a message and run the GM agent.
+    
+    This runs asynchronously after the user message is saved,
+    allowing the API to return immediately. Progress is communicated
+    via SSE broadcasts.
+    """
+    lock = get_world_lock(world_id)
+    db = await get_db()
+    broadcaster = get_broadcaster()
+    
+    async with lock:
+        _world_processing[world_id] = True
+        _world_lock_holder[world_id] = {
+            "user_id": user_id,
+            "character_name": character_name,
+        }
+        
+        try:
+            # Broadcast processing started
+            await broadcaster.broadcast(world_id, {
+                "type": "processing_started",
+                "locked_by": user_id,
+                "character_name": character_name,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            
+            # Check if user needs character creation
+            needs_character_creation = False
+            if character_id:
+                char_doc = await db.characters.find_one({"_id": ObjectId(character_id)})
+                if char_doc and char_doc.get("creation_in_progress", False):
+                    needs_character_creation = True
+                    logger.info(f"User {user_id} character {character_id} has creation_in_progress=True")
+            else:
+                needs_character_creation = True
+                logger.warning(f"User {user_id} has no character_id in world {world_id}")
+            
+            # Run the agent
+            try:
+                agent_result = await run_agent(
+                    world_id=world_id,
+                    user_message=user_message_content,
+                    character_name=character_name,
+                    needs_character_creation=needs_character_creation,
+                    db=db,
+                )
+                gm_response = agent_result.response_text
+            except Exception as e:
+                logger.exception(f"Agent error in background processing: {e}")
+                gm_response = f"[The GM encounters a moment of confusion...] (Error: {str(e)[:100]})"
+            
+            # Save GM message
+            gm_msg = Message(
+                world_id=world_id,
+                user_id=None,
+                character_name="Game Master",
+                content=gm_response,
+                message_type="gm",
+            )
+            result = await db.messages.insert_one(gm_msg.to_doc())
+            gm_msg.id = str(result.inserted_id)
+            
+            logger.info(f"Saved GM message {gm_msg.id} in world {world_id} (background)")
+            
+            # Broadcast processing complete - UI will refresh via SSE
+            now = datetime.utcnow().isoformat()
+            await broadcaster.broadcast(world_id, {
+                "type": "processing_complete",
+                "messages_updated_at": now,
+                "events_updated_at": now,
+            })
+            
+        except Exception as e:
+            logger.exception(f"Error in background message processing: {e}")
+            # Broadcast error event so UI can show error state
+            await broadcaster.broadcast(world_id, {
+                "type": "processing_error",
+                "error": str(e)[:200],
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+        finally:
+            _world_processing[world_id] = False
+            _world_lock_holder.pop(world_id, None)
+
+
+# ============================================================================
 # Endpoints
 # ============================================================================
 
-@router.post("/{world_id}/messages", response_model=SendMessageResponse)
+@router.post("/{world_id}/messages", response_model=SendMessageResponse, status_code=202)
 async def send_message(
     world_id: str,
     request: SendMessageRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
 ):
     """
-    Send a message to the GM agent.
+    Send a message to the GM agent (non-blocking).
     
     This endpoint:
-    1. Acquires a per-world lock (returns 409 if busy)
+    1. Checks if world is already processing (returns 409 if busy)
     2. Saves the user message to DB
-    3. Runs the agent synchronously (blocks until complete)
-    4. Saves the GM response to DB
-    5. Returns both messages
+    3. Queues background processing of the GM response
+    4. Returns immediately with 202 Accepted
     
-    The blocking design ensures sequential message ordering
-    and prevents race conditions in multi-user scenarios.
+    The GM response is processed asynchronously. Clients receive
+    updates via the SSE /worlds/{world_id}/updates/stream endpoint:
+    - processing_started: GM is thinking
+    - processing_complete: New messages available (triggers UI refresh)
+    - processing_error: Something went wrong
+    
+    This non-blocking design provides instant feedback while ensuring
+    sequential message ordering via the per-world lock.
     """
     db = await get_db()
     user_id = current_user.id
@@ -260,9 +364,6 @@ async def send_message(
     if not access:
         raise HTTPException(status_code=403, detail="No access to this world")
     
-    # Try to acquire the world lock
-    lock = get_world_lock(world_id)
-    
     # Check if already processing (non-blocking check)
     if is_world_processing(world_id):
         raise HTTPException(
@@ -270,129 +371,47 @@ async def send_message(
             detail="World is currently processing a message. Please wait."
         )
     
-    # Try to acquire lock with timeout
-    try:
-        acquired = lock.locked()
-        if acquired:
-            raise HTTPException(
-                status_code=409,
-                detail="World is currently processing a message. Please wait."
-            )
-        
-        async with lock:
-            _world_processing[world_id] = True
-            broadcaster = get_broadcaster()
-            
-            try:
-                # Check if user needs character creation
-                character_id = access.get("character_id")
-                needs_character_creation = False
-                if character_id:
-                    # Look up character to check creation_in_progress
-                    char_doc = await db.characters.find_one({"_id": ObjectId(character_id)})
-                    if char_doc and char_doc.get("creation_in_progress", False):
-                        needs_character_creation = True
-                        logger.info(f"User {user_id} character {character_id} has creation_in_progress=True")
-                else:
-                    # No character linked (shouldn't happen with new flow, but handle gracefully)
-                    needs_character_creation = True
-                    logger.warning(f"User {user_id} has no character_id in world {world_id}")
-                
-                # Get character name for this user
-                character_name = await get_user_character_name(db, user_id, world_id)
-                
-                # Track who holds the lock and broadcast processing started
-                _world_lock_holder[world_id] = {
-                    "user_id": user_id,
-                    "character_name": character_name,
-                }
-                await broadcaster.broadcast(world_id, {
-                    "type": "processing_started",
-                    "locked_by": user_id,
-                    "character_name": character_name,
-                    "timestamp": datetime.utcnow().isoformat(),
-                })
-                
-                # Save user message (save the ORIGINAL content, not the substituted message)
-                user_msg = Message(
-                    world_id=world_id,
-                    user_id=user_id,
-                    character_name=character_name,
-                    content=request.content,
-                    message_type="player",
-                )
-                result = await db.messages.insert_one(user_msg.to_doc())
-                user_msg.id = str(result.inserted_id)
-                
-                logger.info(f"Saved user message {user_msg.id} in world {world_id}")
-                
-                # Run the agent
-                try:
-                    agent_result = await run_agent(
-                        world_id=world_id,
-                        user_message=request.content,
-                        character_name=character_name,
-                        needs_character_creation=needs_character_creation,
-                        db=db,
-                    )
-                    gm_response = agent_result.response_text
-                            
-                except Exception as e:
-                    logger.exception(f"Agent error: {e}")
-                    gm_response = f"[The GM encounters a moment of confusion...] (Error: {str(e)[:100]})"
-                
-                # Save GM message
-                gm_msg = Message(
-                    world_id=world_id,
-                    user_id=None,
-                    character_name="Game Master",
-                    content=gm_response,
-                    message_type="gm",
-                )
-                result = await db.messages.insert_one(gm_msg.to_doc())
-                gm_msg.id = str(result.inserted_id)
-                
-                logger.info(f"Saved GM message {gm_msg.id} in world {world_id}")
-                
-                # Broadcast processing complete with timestamps for refresh
-                now = datetime.utcnow().isoformat()
-                await broadcaster.broadcast(world_id, {
-                    "type": "processing_complete",
-                    "messages_updated_at": now,
-                    "events_updated_at": now,
-                })
-                
-                return SendMessageResponse(
-                    user_message=MessageResponse(
-                        id=user_msg.id,
-                        world_id=user_msg.world_id,
-                        user_id=user_msg.user_id,
-                        character_name=user_msg.character_name,
-                        display_name=current_user.display_name,
-                        content=user_msg.content,
-                        message_type=user_msg.message_type,
-                        created_at=user_msg.created_at.isoformat(),
-                    ),
-                    gm_message=MessageResponse(
-                        id=gm_msg.id,
-                        world_id=gm_msg.world_id,
-                        user_id=gm_msg.user_id,
-                        character_name=gm_msg.character_name,
-                        display_name=None,
-                        content=gm_msg.content,
-                        message_type=gm_msg.message_type,
-                        created_at=gm_msg.created_at.isoformat(),
-                    ),
-                )
-            finally:
-                _world_processing[world_id] = False
-                _world_lock_holder.pop(world_id, None)
-                
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Get character name for this user
+    character_name = await get_user_character_name(db, user_id, world_id)
+    
+    # Save user message immediately
+    user_msg = Message(
+        world_id=world_id,
+        user_id=user_id,
+        character_name=character_name,
+        content=request.content,
+        message_type="player",
+    )
+    result = await db.messages.insert_one(user_msg.to_doc())
+    user_msg.id = str(result.inserted_id)
+    
+    logger.info(f"Saved user message {user_msg.id} in world {world_id}, queuing background processing")
+    
+    # Queue background processing
+    background_tasks.add_task(
+        process_message_background,
+        world_id=world_id,
+        user_id=user_id,
+        user_message_content=request.content,
+        character_name=character_name,
+        character_id=access.get("character_id"),
+    )
+    
+    # Return immediately with user message and processing status
+    return SendMessageResponse(
+        user_message=MessageResponse(
+            id=user_msg.id,
+            world_id=user_msg.world_id,
+            user_id=user_msg.user_id,
+            character_name=user_msg.character_name,
+            display_name=current_user.display_name,
+            content=user_msg.content,
+            message_type=user_msg.message_type,
+            created_at=user_msg.created_at.isoformat(),
+        ),
+        gm_message=None,  # Will be available after background processing
+        status="processing",
+    )
 
 
 @router.get("/{world_id}/messages/stream")
