@@ -26,32 +26,57 @@ class MCPClient:
     
     async def connect(self) -> None:
         """Connect to the MCP server and fetch available tools via SSE."""
-        max_retries = 3
+        max_retries = 5
+        base_delay = 2
         for attempt in range(max_retries):
             try:
                 await self._do_connect()
                 return
             except Exception as e:
-                logger.error(f"Connection attempt {attempt + 1} failed: {e}")
+                delay = base_delay * (2 ** attempt)  # exponential backoff: 2, 4, 8, 16, 32s
+                logger.error(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")
                 if attempt == max_retries - 1:
+                    logger.error(f"All {max_retries} connection attempts to {self.base_url} failed")
                     raise
-                await asyncio.sleep(1)
+                logger.info(f"Retrying in {delay}s...")
+                await asyncio.sleep(delay)
     
     async def _do_connect(self) -> None:
         """Perform the actual connection with SSE for bidirectional communication."""
+        # Clean up any previous client
+        if self._http_client:
+            await self._http_client.aclose()
+        if self._sse_task:
+            self._sse_task.cancel()
+        
         self._http_client = httpx.AsyncClient(timeout=60.0)
         
-        logger.info(f"Connecting to SSE at {self.base_url}/sse")
+        sse_url = f"{self.base_url}/sse"
+        logger.info(f"Connecting to SSE at {sse_url}")
+        
+        # First, do a quick health check to verify the server is reachable
+        try:
+            health_resp = await self._http_client.get(f"{self.base_url}/health", timeout=15.0)
+            logger.info(f"MCP health check: status={health_resp.status_code}, body={health_resp.text[:200]}")
+            if health_resp.status_code != 200:
+                raise ValueError(f"MCP health check failed: HTTP {health_resp.status_code} - {health_resp.text[:200]}")
+        except httpx.ConnectError as e:
+            raise ValueError(f"Cannot reach MCP server at {self.base_url}: {e}")
+        except httpx.TimeoutException as e:
+            raise ValueError(f"MCP health check timed out at {self.base_url}: {e}")
         
         # Create an event to wait for endpoint
         endpoint_event = asyncio.Event()
+        connection_error: list[Exception] = []
         
         # Start SSE listener in background
         async def sse_listener():
             try:
-                async with aconnect_sse(self._http_client, "GET", f"{self.base_url}/sse") as event_source:
+                logger.info(f"Opening SSE connection to {sse_url}")
+                async with aconnect_sse(self._http_client, "GET", sse_url) as event_source:
+                    logger.info(f"SSE connection established, status={event_source.response.status_code}")
                     async for sse in event_source.aiter_sse():
-                        logger.info(f"SSE event: {sse.event}")
+                        logger.info(f"SSE event: type={sse.event}, data={sse.data[:200] if sse.data else '(empty)'}")
                         
                         if sse.event == "endpoint":
                             # Data is the endpoint URL
@@ -71,16 +96,28 @@ class MCPClient:
                             except json.JSONDecodeError as e:
                                 logger.error(f"Failed to parse SSE message: {e}")
             except Exception as e:
-                logger.error(f"SSE listener error: {e}")
+                logger.error(f"SSE listener error: {type(e).__name__}: {e}")
+                connection_error.append(e)
+                endpoint_event.set()  # Unblock the waiter so it doesn't hang
         
         # Start the SSE listener task
         self._sse_task = asyncio.create_task(sse_listener())
         
         # Wait for endpoint with timeout
         try:
-            await asyncio.wait_for(endpoint_event.wait(), timeout=10.0)
+            await asyncio.wait_for(endpoint_event.wait(), timeout=30.0)
         except asyncio.TimeoutError:
-            raise ValueError("Timeout waiting for endpoint from MCP server")
+            raise ValueError(
+                f"Timeout (30s) waiting for endpoint event from MCP server at {sse_url}. "
+                f"Health check passed but SSE connection did not yield an endpoint event."
+            )
+        
+        # Check if the SSE listener hit an error instead of getting the endpoint
+        if connection_error:
+            raise ValueError(f"SSE connection failed: {connection_error[0]}")
+        
+        if not self._message_endpoint:
+            raise ValueError("SSE connected but no endpoint received")
         
         # Now perform initialization
         logger.info("Sending initialize request...")
@@ -262,12 +299,28 @@ _mcp_client: MCPClient | None = None
 
 
 async def get_mcp_client(base_url: str = "http://localhost:8080") -> MCPClient:
-    """Get or create the MCP client singleton."""
+    """Get or create the MCP client singleton.
+    
+    If the previous connection failed or the client has no tools cached,
+    reset and reconnect to avoid returning a stale/broken client.
+    """
     global _mcp_client
     
+    # Reset stale client: if it exists but has no tools, something went wrong
+    if _mcp_client is not None and len(_mcp_client._tools_cache) == 0:
+        logger.warning("MCP client exists but has 0 cached tools — resetting for fresh connection")
+        await _mcp_client.close()
+        _mcp_client = None
+    
     if _mcp_client is None:
-        _mcp_client = MCPClient(base_url)
-        await _mcp_client.connect()
+        client = MCPClient(base_url)
+        try:
+            await client.connect()
+        except Exception:
+            # Don't leave a broken client as the singleton
+            await client.close()
+            raise
+        _mcp_client = client
     
     return _mcp_client
 
