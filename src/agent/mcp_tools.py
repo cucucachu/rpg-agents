@@ -1,11 +1,9 @@
 """MCP client for connecting to rpg-mcp server and exposing tools to LangChain."""
 
-import json
 import asyncio
 import logging
 from typing import Any
 import httpx
-from httpx_sse import aconnect_sse
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
 
@@ -13,19 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 class MCPClient:
-    """Client for connecting to an MCP server via SSE transport."""
+    """Client for connecting to an MCP server via Streamable HTTP transport."""
     
     def __init__(self, base_url: str = "http://localhost:8080"):
         self.base_url = base_url
+        self._mcp_endpoint = f"{base_url}/mcp"
         self._tools_cache: dict[str, dict] = {}
-        self._message_endpoint: str | None = None
         self._http_client: httpx.AsyncClient | None = None
-        self._pending_responses: dict[int, asyncio.Future] = {}
         self._message_id = 0
-        self._sse_task: asyncio.Task | None = None
     
     async def connect(self) -> None:
-        """Connect to the MCP server and fetch available tools via SSE."""
+        """Connect to the MCP server and fetch available tools."""
         max_retries = 5
         base_delay = 2
         for attempt in range(max_retries):
@@ -42,19 +38,16 @@ class MCPClient:
                 await asyncio.sleep(delay)
     
     async def _do_connect(self) -> None:
-        """Perform the actual connection with SSE for bidirectional communication."""
+        """Perform the actual connection via Streamable HTTP."""
         # Clean up any previous client
         if self._http_client:
             await self._http_client.aclose()
-        if self._sse_task:
-            self._sse_task.cancel()
         
         self._http_client = httpx.AsyncClient(timeout=60.0)
         
-        sse_url = f"{self.base_url}/sse"
-        logger.info(f"Connecting to SSE at {sse_url}")
+        logger.info(f"Connecting to MCP server at {self.base_url}")
         
-        # First, do a quick health check to verify the server is reachable
+        # Health check to verify the server is reachable
         try:
             health_resp = await self._http_client.get(f"{self.base_url}/health", timeout=15.0)
             logger.info(f"MCP health check: status={health_resp.status_code}, body={health_resp.text[:200]}")
@@ -65,84 +58,24 @@ class MCPClient:
         except httpx.TimeoutException as e:
             raise ValueError(f"MCP health check timed out at {self.base_url}: {e}")
         
-        # Create an event to wait for endpoint
-        endpoint_event = asyncio.Event()
-        connection_error: list[Exception] = []
-        
-        # Start SSE listener in background
-        async def sse_listener():
-            try:
-                logger.info(f"Opening SSE connection to {sse_url}")
-                async with aconnect_sse(self._http_client, "GET", sse_url) as event_source:
-                    logger.info(f"SSE connection established, status={event_source.response.status_code}")
-                    async for sse in event_source.aiter_sse():
-                        logger.info(f"SSE event: type={sse.event}, data={sse.data[:200] if sse.data else '(empty)'}")
-                        
-                        if sse.event == "endpoint":
-                            # Data is the endpoint URL
-                            self._message_endpoint = sse.data.strip()
-                            if self._message_endpoint.startswith("/"):
-                                self._message_endpoint = f"{self.base_url}{self._message_endpoint}"
-                            logger.info(f"Got message endpoint: {self._message_endpoint}")
-                            endpoint_event.set()
-                        
-                        elif sse.event == "message":
-                            # This is a response to one of our requests
-                            try:
-                                data = json.loads(sse.data)
-                                msg_id = data.get("id")
-                                if msg_id and msg_id in self._pending_responses:
-                                    self._pending_responses[msg_id].set_result(data)
-                            except json.JSONDecodeError as e:
-                                logger.error(f"Failed to parse SSE message: {e}")
-            except Exception as e:
-                logger.error(f"SSE listener error: {type(e).__name__}: {e}")
-                connection_error.append(e)
-                endpoint_event.set()  # Unblock the waiter so it doesn't hang
-        
-        # Start the SSE listener task
-        self._sse_task = asyncio.create_task(sse_listener())
-        
-        # Wait for endpoint with timeout
-        try:
-            await asyncio.wait_for(endpoint_event.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            raise ValueError(
-                f"Timeout (30s) waiting for endpoint event from MCP server at {sse_url}. "
-                f"Health check passed but SSE connection did not yield an endpoint event."
-            )
-        
-        # Check if the SSE listener hit an error instead of getting the endpoint
-        if connection_error:
-            raise ValueError(f"SSE connection failed: {connection_error[0]}")
-        
-        if not self._message_endpoint:
-            raise ValueError("SSE connected but no endpoint received")
-        
-        # Now perform initialization
+        # Initialize
         logger.info("Sending initialize request...")
-        init_response = await self._send_message_and_wait({
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
+        init_response = await self._send_request(
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": {"name": "rpg-agents", "version": "1.0.0"}
             }
-        })
+        )
         logger.info(f"Initialize response: {init_response}")
         
         # Send initialized notification (no response expected)
-        await self._send_message({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        })
+        await self._send_notification("notifications/initialized")
         
         # List tools
         logger.info("Listing tools...")
-        tools_response = await self._send_message_and_wait({
-            "method": "tools/list",
-            "params": {}
-        })
+        tools_response = await self._send_request("tools/list", {})
         
         if tools_response and "result" in tools_response:
             tools = tools_response["result"].get("tools", [])
@@ -152,58 +85,50 @@ class MCPClient:
         else:
             logger.warning(f"Unexpected tools response: {tools_response}")
     
-    async def _send_message(self, message: dict) -> None:
-        """Send a JSON-RPC message without waiting for response."""
-        if not self._message_endpoint or not self._http_client:
-            raise ValueError("Not connected")
-        
-        await self._http_client.post(
-            self._message_endpoint,
-            json=message,
-            headers={"Content-Type": "application/json"}
-        )
-    
-    async def _send_message_and_wait(self, message: dict, timeout: float = 30.0) -> dict:
-        """Send a JSON-RPC message and wait for response via SSE."""
-        if not self._message_endpoint or not self._http_client:
+    async def _send_request(self, method: str, params: dict, timeout: float = 30.0) -> dict:
+        """Send JSON-RPC request, get JSON response."""
+        if not self._http_client:
             raise ValueError("Not connected")
         
         self._message_id += 1
-        msg_id = self._message_id
+        resp = await self._http_client.post(
+            self._mcp_endpoint,
+            json={"jsonrpc": "2.0", "id": self._message_id, "method": method, "params": params},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+            timeout=timeout,
+        )
+        return resp.json()
+    
+    async def _send_notification(self, method: str, params: dict | None = None) -> None:
+        """Send JSON-RPC notification (no id, no response expected)."""
+        if not self._http_client:
+            raise ValueError("Not connected")
         
-        # Prepare the full message
-        full_message = {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            **message
-        }
+        message = {"jsonrpc": "2.0", "method": method}
+        if params:
+            message["params"] = params
         
-        # Create a future for the response
-        response_future = asyncio.get_event_loop().create_future()
-        self._pending_responses[msg_id] = response_future
-        
-        try:
-            # Send the message
-            await self._http_client.post(
-                self._message_endpoint,
-                json=full_message,
-                headers={"Content-Type": "application/json"}
-            )
-            
-            # Wait for response via SSE
-            return await asyncio.wait_for(response_future, timeout=timeout)
-        finally:
-            self._pending_responses.pop(msg_id, None)
+        await self._http_client.post(
+            self._mcp_endpoint,
+            json=message,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
     
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
-        response = await self._send_message_and_wait({
-            "method": "tools/call",
-            "params": {
+        response = await self._send_request(
+            "tools/call",
+            {
                 "name": name,
                 "arguments": arguments
             }
-        })
+        )
         
         if response:
             if "result" in response:
@@ -218,8 +143,6 @@ class MCPClient:
     
     async def close(self):
         """Close the connection."""
-        if self._sse_task:
-            self._sse_task.cancel()
         if self._http_client:
             await self._http_client.aclose()
     
