@@ -15,7 +15,7 @@ class MCPClient:
     
     def __init__(self, base_url: str = "http://localhost:8080"):
         self.base_url = base_url
-        self._mcp_endpoint = f"{base_url}/mcp"
+        self._mcp_endpoint = f"{base_url}/mcp/"  # Trailing slash to avoid 307 redirect
         self._tools_cache: dict[str, dict] = {}
         self._http_client: httpx.AsyncClient | None = None
         self._message_id = 0
@@ -43,7 +43,11 @@ class MCPClient:
         if self._http_client:
             await self._http_client.aclose()
         
-        self._http_client = httpx.AsyncClient(timeout=60.0)
+        # Configure client to follow redirects but preserve POST method
+        self._http_client = httpx.AsyncClient(
+            timeout=60.0,
+            follow_redirects=True,
+        )
         
         logger.info(f"Connecting to MCP server at {self.base_url}")
         
@@ -100,7 +104,24 @@ class MCPClient:
             },
             timeout=timeout,
         )
-        return resp.json()
+        
+        # Check status code before parsing JSON
+        if resp.status_code != 200:
+            error_body = resp.text[:500] if resp.text else "(empty)"
+            raise ValueError(
+                f"MCP request failed: HTTP {resp.status_code} - {error_body}"
+            )
+        
+        # Try to parse JSON with better error message
+        try:
+            return resp.json()
+        except Exception as e:
+            raise ValueError(
+                f"Failed to parse MCP response as JSON. "
+                f"Status: {resp.status_code}, "
+                f"Body: {repr(resp.text[:200])}, "
+                f"Error: {e}"
+            )
     
     async def _send_notification(self, method: str, params: dict | None = None) -> None:
         """Send JSON-RPC notification (no id, no response expected)."""
