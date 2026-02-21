@@ -836,6 +836,13 @@ def scribe_init_node(state: GMAgentState) -> dict[str, Any]:
     
     # 4. THIS TURN's content - extracted and formatted clearly
     this_turn_content = _extract_this_turn_content(messages, history_count)
+
+    # Append the GM's final narrative response so the scribe sees what actually happened.
+    # gm_final_response is captured by capture_gm_response_node and lives in state,
+    # not in the messages list, which is why _extract_this_turn_content misses it.
+    gm_final_response = state.get("gm_final_response", "")
+    if gm_final_response:
+        this_turn_content = this_turn_content + f"\n\nGM RESPONSE:\n{gm_final_response}"
     
     scribe_messages.append(SystemMessage(
         content=(
