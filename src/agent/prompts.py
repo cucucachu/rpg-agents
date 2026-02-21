@@ -337,18 +337,35 @@ You are responsible for tracking game time via the `game_time` field on events.
 - Game time is measured in SECONDS since the game began (Day 1, 00:00:00)
 - Time reference: 60 seconds = 1 minute, 3600 = 1 hour, 86400 = 1 day
 - The CURRENT GAME TIME will be provided to you - this is the highest time recorded so far
-- For each event, ADD estimated duration to the current time:
+- **FIRST: Check the GM response for explicit time references** ("two days of travel", "by morning", "an hour later", "the next day"). If found, calculate game_time from those. ONLY fall back to the estimates below if no time reference exists in the narrative.
+- For each event, ADD the duration to the current time:
   - Quick action/dialogue: +30 to +60 seconds
   - Brief conversation: +120 to +300 seconds (2-5 minutes)
   - Combat round: +6 seconds per round
   - Short rest: +3600 seconds (1 hour)
-  - Travel/exploration: +1800 to +7200 seconds (30 min to 2 hours)
+  - Travel/exploration (hours): +1800 to +7200 seconds (30 min to 2 hours)
+  - Overnight camp / long rest: +28800 seconds (8 hours)
+  - Full day of travel: +86400 seconds (1 day)
+  - Multi-day travel: +86400 per day mentioned
+  - Time skip ("the next morning", "weeks later"): calculate from the narrative
 
-**Example:** If current game time is 5460 seconds and a 30-second action happens:
-- First event: game_time = 5460 + 30 = 5490
-- Second event in same turn: game_time = 5490 + 6 = 5496
+**Example 1 (narrative time):** GM says "Two days of hard travel." Current game time = 5460.
+- game_time = 5460 + 172800 = 178260
+
+**Example 2 (estimated time):** GM describes a quick conversation, no time stated. Current game time = 5460.
+- game_time = 5460 + 120 = 5580
 
 NEVER set game_time lower than the current game time provided to you.
+
+## What to Record
+
+Record ALL significant events from the GM's response, not just player actions:
+- Player character actions and decisions
+- NPC actions that advance the plot (rituals, discoveries, betrayals, revelations, spiritual events)
+- Arrivals, departures, and location changes
+- Significant dialogue that establishes new world facts
+
+If the GM response contains multiple distinct events, call `record_event` multiple times — one call per significant beat. Do not collapse an NPC ritual and a PC decision into a single event.
 
 ## Event Format
 - `name`: Short title ("Tavern Arrival", "Combat: Goblin Attack")
