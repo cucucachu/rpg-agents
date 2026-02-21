@@ -654,7 +654,16 @@ def historian_init_node(state: GMAgentState) -> dict[str, Any]:
         historian_messages.append(SystemMessage(content=f"[WORLD STATE]\n{world_context}\n[END WORLD STATE]"))
     if events_context:
         historian_messages.append(SystemMessage(content=f"[RECENT EVENTS]\n{events_context}\n[END RECENT EVENTS]"))
-    
+
+    # Inject the prior GM response so the historian can proactively look up NPCs
+    # the GM is likely to re-narrate this turn, not just those the player mentioned
+    if history_count > 0:
+        prior_msg = messages[history_count - 1]
+        if isinstance(prior_msg, AIMessage) and prior_msg.content:
+            historian_messages.append(SystemMessage(
+                content=f"[PRIOR GM RESPONSE]\n{prior_msg.content}\n[END PRIOR GM RESPONSE]"
+            ))
+
     # Current turn user message
     if history_count < len(messages):
         player_msg = messages[history_count]
