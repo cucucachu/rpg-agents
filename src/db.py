@@ -26,6 +26,10 @@ async def connect_db() -> AsyncIOMotorDatabase:
     await _db.invite_codes.create_index("code", unique=True)
     await _db.world_access.create_index([("user_id", 1), ("world_id", 1)], unique=True)
     await _db.messages.create_index([("world_id", 1), ("created_at", -1)])
+    await _db.traces.create_index([("world_id", 1)])
+    await _db.traces.create_index("user_message_id", unique=True)
+    await _db.traces.create_index("gm_message_id", unique=True)
+    await _db.bug_reports.create_index([("trace_id", 1)])
     
     return _db
 

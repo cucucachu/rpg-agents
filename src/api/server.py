@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from ..agent import create_gm_agent, GM_SYSTEM_PROMPT
 from ..agent.gm_agent import GMAgent
 from ..db import connect_db, close_db
-from . import auth, worlds, websocket as ws_module, messages as messages_module, events as events_module, updates as updates_module
+from . import auth, worlds, websocket as ws_module, messages as messages_module, events as events_module, updates as updates_module, bugs as bugs_module
 from .cors_config import CORS_CONFIG, print_cors_config
 
 # Configure logging
@@ -93,6 +93,7 @@ def create_app() -> FastAPI:
     app.include_router(messages_module.router)  # New message endpoints
     app.include_router(events_module.router)  # Events endpoint
     app.include_router(updates_module.router)  # Multi-user update notifications
+    app.include_router(bugs_module.router)  # Bug reports
     
     return app
 

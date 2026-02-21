@@ -18,6 +18,7 @@ class Message(BaseModel):
     content: str
     message_type: Literal["player", "gm", "system"] = "player"
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    trace_id: Optional[str] = None  # Links to the associated agent trace
     
     def to_doc(self) -> dict:
         """Convert to MongoDB document."""

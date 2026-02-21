@@ -9,10 +9,9 @@ Architecture:
 6. bard - Records new NPCs, locations, lore, factions from narrative
 7. accountant_agent - Syncs game state (damage, healing, status, items) to database
 8. scribe_agent - Records events and chronicles
-9. debug_state - Logs full state at end of turn (if DEBUG=true)
 
 Flow:
-load_context -> historian <-> historian_tools -> compile_historian -> gm_agent <-> gm_tools -> capture_response -> bard <-> bard_tools -> (if creation_in_progress: debug_state else: accountant -> ... -> debug_state) -> END
+load_context -> historian <-> historian_tools -> compile_historian -> gm_agent <-> gm_tools -> capture_response -> bard <-> bard_tools -> (if creation_in_progress: END else: accountant -> ... -> scribe -> END)
 """
 
 import logging
@@ -1141,116 +1140,6 @@ def persist_response_node(state: GMAgentState) -> dict[str, Any]:
 # Node: Debug State Logger
 # ============================================================================
 
-def debug_state_logger_node(state: GMAgentState) -> dict[str, Any]:
-    """Log the complete state at the end of a turn for debugging purposes.
-    
-    Only logs if DEBUG environment variable is set to true.
-    """
-    if not DEBUG:
-        return {}
-    
-    world_id = state.get("world_id", "unknown")
-    
-    logger.debug("=" * 80)
-    logger.debug(f"[DEBUG STATE] Final state for world {world_id}")
-    logger.debug("=" * 80)
-    
-    # Log state field by field for readability
-    for key, value in state.items():
-        if key.endswith("_messages"):
-            # For agent-specific message lists, log with smart truncation
-            msg_list = value if isinstance(value, list) else []
-            msg_types = [type(m).__name__ for m in msg_list]
-            logger.debug(f"\n{key}: {len(msg_list)} messages - {msg_types}")
-            
-            # Log each message with appropriate detail level
-            for i, msg in enumerate(msg_list):
-                msg_type = type(msg).__name__
-                
-                if isinstance(msg, SystemMessage):
-                    # System messages: heavily truncated (just first 100 chars)
-                    content = str(msg.content) if hasattr(msg, "content") else ""
-                    preview = content[:100] + "..." if len(content) > 100 else content
-                    logger.debug(f"  [{i}] SystemMessage: {preview}")
-                
-                elif isinstance(msg, AIMessage):
-                    # AI messages: show moderate content + FULL tool calls
-                    content = str(msg.content) if hasattr(msg, "content") else ""
-                    content_preview = content[:300] + "..." if len(content) > 300 else content
-                    logger.debug(f"  [{i}] AIMessage: {content_preview}")
-                    
-                    # Show FULL tool calls
-                    if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        logger.debug(f"      Tool Calls ({len(msg.tool_calls)}):")
-                        for tc in msg.tool_calls:
-                            logger.debug(f"        - {tc.get('name')}({json.dumps(tc.get('args', {}), indent=10)})")
-                
-                elif isinstance(msg, ToolMessage):
-                    # Tool messages: show FULL content (these are results we need to see)
-                    content = str(msg.content) if hasattr(msg, "content") else ""
-                    tool_name = getattr(msg, "name", "unknown")
-                    logger.debug(f"  [{i}] ToolMessage [{tool_name}]:")
-                    logger.debug(f"      {content}")
-                
-                elif isinstance(msg, HumanMessage):
-                    # Human messages: moderate truncation
-                    content = str(msg.content) if hasattr(msg, "content") else ""
-                    preview = content[:200] + "..." if len(content) > 200 else content
-                    logger.debug(f"  [{i}] HumanMessage: {preview}")
-                
-                else:
-                    # Unknown message type
-                    logger.debug(f"  [{i}] {msg_type}: {str(msg)[:100]}")
-        
-        elif key == "messages":
-            # Global conversation history - show only latest user and GM messages
-            msg_list = value if isinstance(value, list) else []
-            logger.debug(f"\n{key}: {len(msg_list)} conversation messages (showing last 2)")
-            
-            # Get last user message (HumanMessage)
-            last_user = None
-            last_gm = None
-            for msg in reversed(msg_list):
-                if isinstance(msg, HumanMessage) and last_user is None:
-                    last_user = msg
-                elif isinstance(msg, AIMessage) and last_gm is None:
-                    last_gm = msg
-                if last_user and last_gm:
-                    break
-            
-            if last_user:
-                content = str(last_user.content) if hasattr(last_user, "content") else ""
-                logger.debug(f"  [LAST USER]: {content}")
-            
-            if last_gm:
-                content = str(last_gm.content) if hasattr(last_gm, "content") else ""
-                logger.debug(f"  [LAST GM]: {content}")
-        
-        elif key in ["world_context", "events_context", "enriched_context"]:
-            # Long context strings - log length only
-            value_str = str(value) if value else ""
-            logger.debug(f"\n{key}: {len(value_str)} chars")
-        
-        elif key in ["gm_final_response"]:
-            # Response text - log full (this is what gets saved)
-            value_str = str(value) if value else ""
-            logger.debug(f"\n{key}: {value_str}")
-        
-        elif key == "gm_tool_calls":
-            # Tool calls list - show full details
-            tool_calls = value if isinstance(value, list) else []
-            logger.debug(f"\n{key}: {len(tool_calls)} calls")
-            for tc in tool_calls:
-                logger.debug(f"  - {tc.get('name')}({json.dumps(tc.get('args', {}), indent=6)})")
-        
-        else:
-            # Simple fields - log as-is
-            logger.debug(f"\n{key}: {value}")
-    
-    logger.debug("=" * 80)
-    
-    # Return empty dict - no state changes
-    return {}
 
 
 # ============================================================================
@@ -1268,7 +1157,7 @@ async def create_gm_agent(
     Create the GM agent graph with separated concerns.
 
     Flow:
-    load_context -> ... -> bard <-> bard_tools -> (creation_in_progress ? debug_state : accountant -> ... -> debug_state) -> END
+    load_context -> ... -> bard <-> bard_tools -> (creation_in_progress ? END : accountant -> ... -> scribe -> END)
 
     Agent Responsibilities:
     - Historian: Read-only search to enrich context (lore, characters, locations, events)
@@ -1283,8 +1172,6 @@ async def create_gm_agent(
     
     The capture_response node stores the GM's final response and tool calls
     so the Accountant knows what state changes were already persisted.
-    
-    The debug_state node logs the full state at the end of each turn (if DEBUG=true).
     
     Args:
         db: MongoDB database connection
@@ -1449,7 +1336,6 @@ async def create_gm_agent(
     workflow.add_node("char_creator", char_creator_agent_node)
     workflow.add_node("char_creator_tools", char_creator_tools_node)
     workflow.add_node("persist_response", persist_response_node)
-    workflow.add_node("debug_state", debug_state_logger_node)
 
     # Set entry point
     workflow.set_entry_point("load_context")
@@ -1490,8 +1376,8 @@ async def create_gm_agent(
     )
     workflow.add_edge("char_creator_tools", "char_creator")
     
-    # Persist response -> debug_state -> END (for creation paths)
-    workflow.add_edge("persist_response", "debug_state")
+    # Persist response -> END (for creation paths)
+    workflow.add_edge("persist_response", END)
     
     # Normal gameplay path: historian_init -> historian <-> historian_tools -> compile_historian -> gm_init -> gm_agent -> ...
     workflow.add_edge("historian_init", "historian")
@@ -1549,27 +1435,24 @@ async def create_gm_agent(
     # The Accountant can sync all state changes in a single batch of tool calls
     workflow.add_edge("accountant_tools", "scribe_init")
     
-    # Scribe path: scribe_init -> scribe -> scribe_tools -> debug_state -> END
+    # Scribe path: scribe_init -> scribe -> scribe_tools -> END
     workflow.add_edge("scribe_init", "scribe")
     workflow.add_conditional_edges(
         "scribe",
         should_continue_scribe,
         {
             "scribe_tools": "scribe_tools",
-            "cleanup": "debug_state",
+            "cleanup": END,
         }
     )
-    # NOTE: Scribe tools go directly to debug_state (no loop back to scribe)
+    # NOTE: Scribe tools go directly to END (no loop back to scribe)
     # This prevents duplicate event recording if rate limiting causes retries
     # The Scribe can record events + chronicles in a single batch of tool calls
-    workflow.add_edge("scribe_tools", "debug_state")
-    
-    # All paths converge at debug_state -> END
-    workflow.add_edge("debug_state", END)
+    workflow.add_edge("scribe_tools", END)
     
     # Compile
     graph = workflow.compile()
-    logger.info("Compiled GM agent graph: load_context -> ... -> bard -> (creation_in_progress? debug_state : accountant -> scribe -> debug_state)")
+    logger.info("Compiled GM agent graph: load_context -> ... -> bard -> (creation_in_progress? END : accountant -> scribe -> END)")
     
     config = {
         "provider": provider,

@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from bson import ObjectId
 
 from ..db import get_db
-from ..models import Message, User
+from ..models import Message, Trace, serialize_messages, User
 from .auth import get_current_user, get_current_user_optional
 from .broadcast import get_broadcaster
 from langchain_core.messages import ToolMessage
@@ -157,9 +157,10 @@ async def get_user_character_name(db, user_id: str, world_id: str) -> str:
 
 class AgentResult:
     """Result from running the GM agent."""
-    def __init__(self, response_text: str, created_character_ids: list[str]):
+    def __init__(self, response_text: str, created_character_ids: list[str], final_state: dict | None = None):
         self.response_text = response_text
         self.created_character_ids = created_character_ids
+        self.final_state = final_state
 
 
 # Removed: extract_created_character_ids - PCs are now created deterministically at world create/join time
@@ -224,7 +225,7 @@ async def run_agent(world_id: str, user_message: str, character_name: str, needs
                             response_text = content
                             break
     
-    return AgentResult(response_text=response_text, created_character_ids=[])
+    return AgentResult(response_text=response_text, created_character_ids=[], final_state=final_state)
 
 
 # ============================================================================
@@ -237,6 +238,7 @@ async def process_message_background(
     user_message_content: str,
     character_name: str,
     character_id: str | None,
+    user_message_id: str | None = None,
 ):
     """
     Background task to process a message and run the GM agent.
@@ -300,9 +302,55 @@ async def process_message_background(
             )
             result = await db.messages.insert_one(gm_msg.to_doc())
             gm_msg.id = str(result.inserted_id)
-            
+
             logger.info(f"Saved GM message {gm_msg.id} in world {world_id} (background)")
-            
+
+            # Persist agent trace and backlink both messages
+            if user_message_id and agent_result.final_state:
+                try:
+                    state = agent_result.final_state
+                    agent_message_keys = [
+                        "historian_messages", "gm_messages", "bard_messages",
+                        "accountant_messages", "scribe_messages",
+                        "world_creator_messages", "char_creator_messages",
+                    ]
+                    agent_messages_serialized: dict = {}
+                    for key in agent_message_keys:
+                        msgs = state.get(key)
+                        if msgs:
+                            agent_name = key.replace("_messages", "")
+                            agent_messages_serialized[agent_name] = serialize_messages(msgs)
+
+                    if state.get("creation_in_progress"):
+                        route = "world_creator"
+                    elif state.get("needs_character_creation"):
+                        route = "char_creator"
+                    else:
+                        route = "gm"
+
+                    trace = Trace(
+                        world_id=world_id,
+                        user_message_id=user_message_id,
+                        gm_message_id=gm_msg.id,
+                        route=route,
+                        gm_final_response=gm_response,
+                        agent_messages=agent_messages_serialized,
+                    )
+                    trace_result = await db.traces.insert_one(trace.to_doc())
+                    trace_id = str(trace_result.inserted_id)
+
+                    await db.messages.update_one(
+                        {"_id": ObjectId(user_message_id)},
+                        {"$set": {"trace_id": trace_id}},
+                    )
+                    await db.messages.update_one(
+                        {"_id": ObjectId(gm_msg.id)},
+                        {"$set": {"trace_id": trace_id}},
+                    )
+                    logger.info(f"Saved trace {trace_id} for world {world_id}")
+                except Exception as trace_err:
+                    logger.exception(f"Failed to persist trace: {trace_err}")
+
             # Broadcast processing complete - UI will refresh via SSE
             now = datetime.utcnow().isoformat()
             await broadcaster.broadcast(world_id, {
@@ -395,6 +443,7 @@ async def send_message(
         user_message_content=request.content,
         character_name=character_name,
         character_id=access.get("character_id"),
+        user_message_id=user_msg.id,
     )
     
     # Return immediately with user message and processing status
