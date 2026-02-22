@@ -30,6 +30,29 @@ from langchain_core.messages import ToolMessage
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/worlds", tags=["messages"])
 
+# ============================================================================
+# Step Detection for Processing Progress
+# ============================================================================
+
+# Ordered list of (trigger_keys, step_name). First match wins.
+_STEP_KEY_MAP: list[tuple[frozenset[str], str]] = [
+    (frozenset({"world_context"}), "loading"),
+    (frozenset({"historian_messages"}), "historian"),
+    (frozenset({"barrister_messages"}), "barrister"),
+    (frozenset({"gm_messages"}), "gm"),
+    (frozenset({"bard_messages", "accountant_messages", "scribe_messages"}), "finalizing"),
+    (frozenset({"world_creator_messages"}), "world_creator"),
+    (frozenset({"char_creator_messages"}), "char_creator"),
+]
+
+
+def _detect_step(new_keys: set[str], prev_keys: set[str]) -> str | None:
+    """Return step name if a new agent phase just started, else None."""
+    for trigger_keys, step_name in _STEP_KEY_MAP:
+        if trigger_keys & new_keys and not (trigger_keys & prev_keys):
+            return step_name
+    return None
+
 # Removed: NEW_PLAYER_MESSAGE - character creation now handled by dedicated agent
 
 # ============================================================================
@@ -277,38 +300,95 @@ async def process_message_background(
             else:
                 needs_character_creation = True
                 logger.warning(f"User {user_id} has no character_id in world {world_id}")
-            
-            # Run the agent
+
+            # Stream the agent graph inline so we can broadcast progress events
+            # and surface the GM message to the UI as soon as it's ready —
+            # before bard / accountant / scribe finish their post-processing.
+            gm_response = ""
+            gm_msg = None
+            gm_response_broadcast = False
+            final_state = None
+            current_step: str | None = None
+            prev_state_keys: set[str] = set()
+
             try:
-                agent_result = await run_agent(
+                recent_messages = await get_recent_messages(db, world_id, limit=20)
+                formatted_message = f"**Submitted by {character_name}**\n\n{user_message_content}"
+
+                async for event in _gm_agent.stream_chat(
+                    message=formatted_message,
                     world_id=world_id,
-                    user_message=user_message_content,
-                    character_name=character_name,
+                    history=recent_messages,
                     needs_character_creation=needs_character_creation,
-                    db=db,
-                )
-                gm_response = agent_result.response_text
+                ):
+                    final_state = event
+
+                    # Detect and broadcast step transitions
+                    current_keys = {k for k in event if event.get(k)}
+                    new_keys = current_keys - prev_state_keys
+                    new_step = _detect_step(new_keys, prev_state_keys)
+                    if new_step and new_step != current_step:
+                        current_step = new_step
+                        await broadcaster.broadcast(world_id, {
+                            "type": "processing_step",
+                            "step": new_step,
+                        })
+                    prev_state_keys = current_keys
+
+                    # Broadcast GM message as soon as capture_response sets gm_final_response
+                    if not gm_response_broadcast and event.get("gm_final_response"):
+                        gm_response = event["gm_final_response"]
+                        gm_msg = Message(
+                            world_id=world_id,
+                            user_id=None,
+                            character_name="Game Master",
+                            content=gm_response,
+                            message_type="gm",
+                        )
+                        result = await db.messages.insert_one(gm_msg.to_doc())
+                        gm_msg.id = str(result.inserted_id)
+                        gm_response_broadcast = True
+                        logger.info(f"Saved GM message {gm_msg.id} early in world {world_id}")
+                        await broadcaster.broadcast(world_id, {
+                            "type": "gm_response_ready",
+                            "message": {
+                                "id": gm_msg.id,
+                                "world_id": world_id,
+                                "user_id": None,
+                                "character_name": "Game Master",
+                                "display_name": None,
+                                "content": gm_response,
+                                "message_type": "gm",
+                                "created_at": gm_msg.created_at.isoformat(),
+                            },
+                        })
+
             except Exception as e:
                 logger.exception(f"Agent error in background processing: {e}")
                 gm_response = f"[The GM encounters a moment of confusion...] (Error: {str(e)[:100]})"
-            
-            # Save GM message
-            gm_msg = Message(
-                world_id=world_id,
-                user_id=None,
-                character_name="Game Master",
-                content=gm_response,
-                message_type="gm",
-            )
-            result = await db.messages.insert_one(gm_msg.to_doc())
-            gm_msg.id = str(result.inserted_id)
 
-            logger.info(f"Saved GM message {gm_msg.id} in world {world_id} (background)")
+            # Fallback: if the graph ended without ever setting gm_final_response
+            # (e.g. an error path), save the GM message now.
+            if not gm_response_broadcast:
+                if not gm_response and final_state:
+                    gm_response = final_state.get("gm_final_response", gm_response)
+                gm_msg = Message(
+                    world_id=world_id,
+                    user_id=None,
+                    character_name="Game Master",
+                    content=gm_response,
+                    message_type="gm",
+                )
+                result = await db.messages.insert_one(gm_msg.to_doc())
+                gm_msg.id = str(result.inserted_id)
+                logger.info(f"Saved GM message {gm_msg.id} (fallback) in world {world_id}")
+
+            logger.info(f"GM message {gm_msg.id} ready in world {world_id}")
 
             # Persist agent trace and backlink both messages
-            if user_message_id and agent_result.final_state:
+            if user_message_id and final_state:
                 try:
-                    state = agent_result.final_state
+                    state = final_state
                     agent_message_keys = [
                         "historian_messages", "barrister_messages", "gm_messages", "bard_messages",
                         "accountant_messages", "scribe_messages",
