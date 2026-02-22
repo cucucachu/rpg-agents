@@ -30,6 +30,7 @@ from langgraph.prebuilt import ToolNode
 from .prompts import (
     GM_SYSTEM_PROMPT,
     HISTORIAN_SYSTEM_PROMPT,
+    BARRISTER_SYSTEM_PROMPT,
     BARD_SYSTEM_PROMPT,
     SCRIBE_SYSTEM_PROMPT,
     ACCOUNTANT_SYSTEM_PROMPT,
@@ -71,6 +72,7 @@ class GMAgentState(TypedDict, total=False):
 
     # Per-agent isolated message lists for ReAct loops and context isolation
     historian_messages: Annotated[list[BaseMessage], operator.add]
+    barrister_messages: Annotated[list[BaseMessage], operator.add]
     gm_messages: Annotated[list[BaseMessage], operator.add]
     bard_messages: Annotated[list[BaseMessage], operator.add]
     accountant_messages: Annotated[list[BaseMessage], operator.add]
@@ -86,6 +88,7 @@ class GMAgentState(TypedDict, total=False):
     world_context: str  # JSON string of world data
     events_context: str  # JSON string of events since last chronicle
     enriched_context: str  # JSON string from Historian (additional findings)
+    mechanics_context: str  # mechanics brief from Barrister, injected into GM as [MECHANICS BRIEF]
     last_chronicle_id: str  # ID of most recent chronicle
     first_event_id: str  # First event ID since last chronicle (for linking)
     last_event_id: str  # Last event ID since last chronicle (for linking)
@@ -372,6 +375,36 @@ def compile_historian_context_node(state: GMAgentState) -> dict[str, Any]:
     enriched_context = "\n\n".join(parts) if parts else "{}"
     logger.debug(f"[compile_historian] enriched_context len={len(enriched_context)}, parts={len(parts)}")
     return {"enriched_context": enriched_context}
+
+
+# ============================================================================
+# Node: Barrister Agent (mechanics enrichment - no tools, read-only analysis)
+# ============================================================================
+
+def create_barrister_agent_node(llm):
+    """Create the Barrister agent node that analyzes mechanics for the current turn."""
+
+    async def barrister_agent_node(state: GMAgentState) -> dict[str, Any]:
+        """Survey the turn situation and produce a mechanics brief for the GM."""
+        messages = list(state.get("barrister_messages", []))
+
+        logger.debug(f"[barrister] Invoking with {len(messages)} messages")
+
+        response = await llm.ainvoke(messages)
+        logger.debug(f"[barrister] response content_len={len(response.content or '')}")
+
+        return {"barrister_messages": [response]}
+
+    return barrister_agent_node
+
+
+def compile_barrister_context_node(state: GMAgentState) -> dict[str, Any]:
+    """Capture Barrister output into mechanics_context for the GM."""
+    messages = state.get("barrister_messages", [])
+    parts = [msg.content for msg in messages if isinstance(msg, AIMessage) and msg.content]
+    mechanics_context = "\n\n".join(parts) if parts else ""
+    logger.debug(f"[compile_barrister] mechanics_context len={len(mechanics_context)}")
+    return {"mechanics_context": mechanics_context}
 
 
 # ============================================================================
@@ -675,6 +708,29 @@ def historian_init_node(state: GMAgentState) -> dict[str, Any]:
     return {"historian_messages": historian_messages}
 
 
+def barrister_init_node(state: GMAgentState) -> dict[str, Any]:
+    """Build initial message context for Barrister agent."""
+    world_context = state.get("world_context")
+    enriched_context = state.get("enriched_context")
+    messages = list(state.get("messages", []))
+    history_count = state.get("history_message_count", 0)
+
+    logger.debug(f"[barrister_init] Building context for Barrister")
+
+    barrister_messages = [SystemMessage(content=BARRISTER_SYSTEM_PROMPT)]
+    if world_context:
+        barrister_messages.append(SystemMessage(content=f"[WORLD STATE]\n{world_context}\n[END WORLD STATE]"))
+    if enriched_context:
+        barrister_messages.append(SystemMessage(content=f"[ENRICHED CONTEXT]\n{enriched_context}\n[END ENRICHED CONTEXT]"))
+    if history_count < len(messages):
+        player_msg = messages[history_count]
+        if hasattr(player_msg, "content"):
+            barrister_messages.append(SystemMessage(content=f"[PLAYER MESSAGE]\n{player_msg.content}\n[END PLAYER MESSAGE]"))
+
+    barrister_messages.append(HumanMessage(content="Survey the current situation. Identify every mechanic that could trigger this turn — the player's action, any NPC or creature actions, environmental effects, ongoing conditions, and any other rules that apply. Produce a mechanics brief covering all of them. If nothing mechanical applies, return an empty brief."))
+    return {"barrister_messages": barrister_messages}
+
+
 def gm_init_node(state: GMAgentState) -> dict[str, Any]:
     """Build initial message context for GM agent."""
     world_id = state.get("world_id")
@@ -706,6 +762,13 @@ def gm_init_node(state: GMAgentState) -> dict[str, Any]:
     if enriched_context:
         system_messages.append(
             SystemMessage(content=f"[ENRICHED CONTEXT - Additional detail from the Historian.]\n{enriched_context}\n[END ENRICHED CONTEXT]")
+        )
+
+    # Inject mechanics context from Barrister (checks, DCs, modifiers, outcome tiers)
+    mechanics_context = state.get("mechanics_context")
+    if mechanics_context:
+        system_messages.append(
+            SystemMessage(content=f"[MECHANICS BRIEF - Barrister's analysis of required checks, DCs, modifiers, and triggered mechanics for this turn.]\n{mechanics_context}\n[END MECHANICS BRIEF]")
         )
 
     # Inject world_id for tool calls
@@ -1288,6 +1351,7 @@ async def create_gm_agent(
 
     # Create LLMs with different temperatures
     historian_llm = get_llm(provider, model, temperature=0.3)
+    barrister_llm = get_llm(provider, model, temperature=0.3)
     bard_llm = get_llm(provider, model, temperature=0.3)
     accountant_llm = get_llm(provider, model, temperature=0.3)
 
@@ -1306,6 +1370,7 @@ async def create_gm_agent(
     load_context_node = await create_load_context_node(db)
     historian_agent_node = create_historian_agent_node(historian_llm_with_tools, db)
     historian_tools_node = create_logging_tool_node(historian_tools, db, "Historian", "historian_messages")
+    barrister_agent_node = create_barrister_agent_node(barrister_llm)
     gm_agent_node = create_gm_agent_node(gm_llm_with_tools, db)
     gm_tools_node = create_logging_tool_node(gm_tools, db, "GM", "gm_messages")
     accountant_agent_node = create_accountant_agent_node(accountant_llm_with_tools, db)
@@ -1327,6 +1392,7 @@ async def create_gm_agent(
     
     # Init nodes
     workflow.add_node("historian_init", historian_init_node)
+    workflow.add_node("barrister_init", barrister_init_node)
     workflow.add_node("gm_init", gm_init_node)
     workflow.add_node("bard_init", bard_init_node)
     workflow.add_node("accountant_init", accountant_init_node)
@@ -1338,6 +1404,8 @@ async def create_gm_agent(
     workflow.add_node("historian", historian_agent_node)
     workflow.add_node("historian_tools", historian_tools_node)
     workflow.add_node("compile_historian", compile_historian_context_node)
+    workflow.add_node("barrister", barrister_agent_node)
+    workflow.add_node("compile_barrister", compile_barrister_context_node)
     workflow.add_node("gm_agent", gm_agent_node)
     workflow.add_node("gm_tools", gm_tools_node)
     workflow.add_node("capture_response", capture_gm_response_node)
@@ -1406,7 +1474,10 @@ async def create_gm_agent(
         }
     )
     workflow.add_edge("historian_tools", "historian")
-    workflow.add_edge("compile_historian", "gm_init")
+    workflow.add_edge("compile_historian", "barrister_init")
+    workflow.add_edge("barrister_init", "barrister")
+    workflow.add_edge("barrister", "compile_barrister")
+    workflow.add_edge("compile_barrister", "gm_init")
     
     # GM path: gm_init -> gm_agent <-> gm_tools -> capture_response -> bard_init -> bard -> ...
     workflow.add_edge("gm_init", "gm_agent")
