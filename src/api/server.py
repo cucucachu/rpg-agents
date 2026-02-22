@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..agent import create_gm_agent, GM_SYSTEM_PROMPT
-from ..agent.gm_agent import GMAgent
+from ..agent.graph import GMAgent
 from ..db import connect_db, close_db
 from . import auth, worlds, websocket as ws_module, messages as messages_module, events as events_module, updates as updates_module, bugs as bugs_module
 from .cors_config import CORS_CONFIG, print_cors_config
