@@ -310,7 +310,7 @@ async def process_message_background(
                 try:
                     state = agent_result.final_state
                     agent_message_keys = [
-                        "historian_messages", "gm_messages", "bard_messages",
+                        "historian_messages", "barrister_messages", "gm_messages", "bard_messages",
                         "accountant_messages", "scribe_messages",
                         "world_creator_messages", "char_creator_messages",
                     ]
