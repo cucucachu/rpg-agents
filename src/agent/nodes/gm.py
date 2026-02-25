@@ -151,11 +151,10 @@ def create_gm_agent_node(llm_with_tools, db):
 
 
 def capture_gm_response_node(state: GMAgentState) -> dict[str, Any]:
-    """Capture the GM's final response and tool calls before transitioning to post-processing agents.
+    """Capture the GM's final response before transitioning to post-processing agents.
 
-    This ensures we have:
-    1. The GM's response stored separately from subsequent agent messages
-    2. A record of all tool calls the GM made (for Accountant to avoid duplicates)
+    Extracts gm_final_response for early UI broadcast. Tool call data remains
+    in gm_messages and is read directly by the accountant and scribe init nodes.
     """
     messages = state.get("gm_messages", [])
 
@@ -166,29 +165,14 @@ def capture_gm_response_node(state: GMAgentState) -> dict[str, Any]:
                 gm_response = msg.content
                 break
 
-    gm_tool_calls = []
-    for msg in messages:
-        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                gm_tool_calls.append({
-                    "name": tc.get("name"),
-                    "args": tc.get("args", {})
-                })
-
     if gm_response:
         logger.info(f"[Capture] Captured GM response: {gm_response[:100]}...")
         logger.debug(f"[capture_response] gm_final_response len={len(gm_response)}")
     else:
         logger.warning("[Capture] No GM response found to capture")
 
-    if gm_tool_calls:
-        tool_names = [tc["name"] for tc in gm_tool_calls]
-        logger.info(f"[Capture] GM made {len(gm_tool_calls)} tool calls: {tool_names}")
-        logger.debug(f"[capture_response] gm_tool_calls: {tool_names}")
-
     return {
         "gm_final_response": gm_response,
-        "gm_tool_calls": gm_tool_calls,
     }
 
 
