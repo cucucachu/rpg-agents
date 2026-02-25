@@ -9,7 +9,7 @@ from langgraph.graph import END
 
 from ..prompts import ACCOUNTANT_SYSTEM_PROMPT
 from ..state import GMAgentState
-from .utils import extract_entity_ids
+from .utils import extract_entity_ids, extract_gm_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ def accountant_init_node(state: GMAgentState) -> dict[str, Any]:
     world_id = state.get("world_id")
     world_context = state.get("world_context")
     gm_response = state.get("gm_final_response", "")
-    gm_tool_calls = state.get("gm_tool_calls", [])
+    gm_tool_calls = extract_gm_tool_calls(state.get("gm_messages", []))
 
     logger.debug("[accountant_init] Building context for Accountant")
 

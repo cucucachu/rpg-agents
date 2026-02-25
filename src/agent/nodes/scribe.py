@@ -10,6 +10,7 @@ from langgraph.graph import END
 from ..prompts import SCRIBE_SYSTEM_PROMPT
 from ..state import GMAgentState
 from .gm import _extract_this_turn_content
+from .utils import extract_gm_roll_results
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,17 @@ def scribe_init_node(state: GMAgentState) -> dict[str, Any]:
             f"{this_turn_content}"
         )
     ))
+
+    gm_roll_results = extract_gm_roll_results(state.get("gm_messages", []))
+    if gm_roll_results:
+        lines = [
+            f"- roll_dice: {r['notation']} = {r['total']} ({r['details']}) — {r['reason']}"
+            for r in gm_roll_results
+        ]
+        scribe_messages.append(SystemMessage(
+            content="=== MECHANICS THIS TURN ===\n" + "\n".join(lines)
+        ))
+        logger.debug(f"[scribe_init] injected {len(gm_roll_results)} roll result(s) into mechanics block")
 
     event_count = len(json.loads(events_context)) if events_context else 0
     logger.debug(f"[scribe_init] current_game_time={current_game_time}, event_count={event_count}")

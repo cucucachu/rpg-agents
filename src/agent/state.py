@@ -51,10 +51,6 @@ class GMAgentState(TypedDict, total=False):
     # This is what gets persisted to the database
     gm_final_response: str
 
-    # GM's tool calls (captured for Accountant to avoid duplicates)
-    # Contains list of tool call dicts with 'name' and 'args'
-    gm_tool_calls: list[dict]
-
     # World creation phase: when True, route to world_creator agent
     creation_in_progress: bool
 

@@ -444,6 +444,16 @@ Record ALL significant events from the GM's response, not just player actions:
 
 If the GM response contains multiple distinct events, call `record_event` multiple times — one call per significant beat. Do not collapse an NPC ritual and a PC decision into a single event.
 
+## Mechanics Recording
+
+If a `=== MECHANICS THIS TURN ===` block appears in your context, the GM made
+dice rolls this turn. For each event that involved a roll, include the mechanical
+outcome inline in the event `description`:
+  [Roll: 1d20+3 = 6 (Perception check — cursory survey)]
+
+Attach each roll to the event it most directly influenced. If a roll's purpose
+does not match a specific event, append it to the most relevant event's description.
+
 ## Event Format
 - `name`: Short title ("Tavern Arrival", "Combat: Goblin Attack")
 - `description`: What happened (1-2 sentences)
