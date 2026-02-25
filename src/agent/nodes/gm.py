@@ -1,14 +1,26 @@
 """GM sub-agent — main narration, dice, and combat management."""
 
 import logging
+import random
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
-from ..prompts import GM_SYSTEM_PROMPT
+from ..prompts import (
+    GM_RANDOM_EVENT_BOON,
+    GM_RANDOM_EVENT_CONFLICT,
+    GM_RANDOM_EVENT_PLEASANT,
+    GM_SYSTEM_PROMPT,
+)
 from ..state import GMAgentState
 
 logger = logging.getLogger(__name__)
+
+_RANDOM_EVENT_PROMPTS = {
+    1:  GM_RANDOM_EVENT_CONFLICT,
+    19: GM_RANDOM_EVENT_PLEASANT,
+    20: GM_RANDOM_EVENT_BOON,
+}
 
 GM_TOOL_NAMES = {
     "roll_dice", "roll_table", "coin_flip", "roll_stat_array", "percentile_roll",
@@ -98,6 +110,13 @@ def gm_init_node(state: GMAgentState) -> dict[str, Any]:
         system_messages.append(SystemMessage(
             content=f"[WORLD ID]\nworld_id for all tool calls: {world_id}\n[END WORLD ID]"
         ))
+
+    roll = random.randint(1, 20)
+    logger.info(f"[gm_init] Proactive event roll: {roll}")
+    event_prompt = _RANDOM_EVENT_PROMPTS.get(roll)
+    if event_prompt:
+        system_messages.append(SystemMessage(content=event_prompt))
+        logger.info(f"[gm_init] Injecting proactive event prompt for roll {roll}")
 
     gm_messages = system_messages + messages
     logger.debug(
