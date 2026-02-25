@@ -415,6 +415,7 @@ async def process_message_background(
                         route=route,
                         gm_final_response=gm_response,
                         agent_messages=agent_messages_serialized,
+                        entity_id_map=state.get("entity_id_map"),
                     )
                     trace_result = await db.traces.insert_one(trace.to_doc())
                     trace_id = str(trace_result.inserted_id)
