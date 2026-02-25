@@ -1,5 +1,6 @@
 """Historian sub-agent — read-only context enrichment via search tools."""
 
+import json
 import logging
 from typing import Any, Literal
 
@@ -7,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 from ..prompts import HISTORIAN_SYSTEM_PROMPT
 from ..state import GMAgentState
+from .utils import extract_entity_ids
 
 logger = logging.getLogger(__name__)
 
@@ -92,9 +94,17 @@ def create_historian_agent_node(llm_with_historian_tools, db):
 
 
 def compile_historian_context_node(state: GMAgentState) -> dict[str, Any]:
-    """Capture historian output (and tool results) into enriched_context for the GM."""
+    """Capture historian output (and tool results) into enriched_context for the GM.
+
+    Also builds entity_id_map by deterministically parsing all ToolMessage JSON
+    responses to extract name→id pairs for every entity the historian fetched.
+    This map is injected into the accountant's context so it can resolve entity
+    names to database IDs without needing its own lookup tools.
+    """
     messages = state.get("historian_messages", [])
     parts = []
+    entity_map: dict[str, str] = {}
+
     for msg in messages:
         if isinstance(msg, AIMessage):
             content = getattr(msg, "content", None)
@@ -106,12 +116,25 @@ def compile_historian_context_node(state: GMAgentState) -> dict[str, Any]:
             content = getattr(msg, "content", None) or str(msg)
             if isinstance(content, list):
                 content = str(content)
+
+            # Deterministically extract entity IDs from the raw tool result before truncation
+            try:
+                parsed = json.loads(content if isinstance(content, str) else str(content))
+                entity_map.update(extract_entity_ids(parsed))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass  # Tool result wasn't JSON (e.g. plain-text error message)
+
             if len(str(content)) > 2000:
                 content = str(content)[:2000] + "..."
             parts.append(f"{getattr(msg, 'name', 'tool')}: {content}")
+
     enriched_context = "\n\n".join(parts) if parts else "{}"
-    logger.debug(f"[compile_historian] enriched_context len={len(enriched_context)}, parts={len(parts)}")
-    return {"enriched_context": enriched_context}
+    entity_id_map = json.dumps(entity_map)
+    logger.debug(
+        f"[compile_historian] enriched_context len={len(enriched_context)}, "
+        f"parts={len(parts)}, entity_id_map entries={len(entity_map)}"
+    )
+    return {"enriched_context": enriched_context, "entity_id_map": entity_id_map}
 
 
 def should_continue_historian(state: GMAgentState) -> Literal["historian_tools", "compile_historian"]:

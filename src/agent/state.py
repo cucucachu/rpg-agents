@@ -43,6 +43,10 @@ class GMAgentState(TypedDict, total=False):
     last_event_id: str   # Last event ID since last chronicle (for linking)
     current_game_time: int  # Game time in seconds from last event (for scribe to track time)
 
+    # Entity ID map built from historian tool results (name → id for any fetched entity)
+    # Injected into accountant context so it can resolve names to IDs without lookup tools
+    entity_id_map: str  # JSON string: {"Whitefang Pass": "abc123", ...}
+
     # GM's final response (captured before scribe runs)
     # This is what gets persisted to the database
     gm_final_response: str

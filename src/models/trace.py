@@ -62,6 +62,7 @@ class Trace(BaseModel):
     route: str  # "gm" | "world_creator" | "char_creator"
     gm_final_response: str
     agent_messages: dict[str, list[dict]]  # agent name -> serialized messages
+    entity_id_map: Optional[str] = None  # JSON string: name→id map built from historian tool results + world context
     bug_report_ids: list[str] = Field(default_factory=list)
 
     def to_doc(self) -> dict:
@@ -101,5 +102,6 @@ class Trace(BaseModel):
             "route": self.route,
             "gm_final_response": self.gm_final_response,
             "agent_messages": self.agent_messages,
+            "entity_id_map": self.entity_id_map,
             "bug_report_ids": self.bug_report_ids,
         }

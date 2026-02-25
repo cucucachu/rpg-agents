@@ -1,5 +1,6 @@
 """Accountant sub-agent — syncs game state changes (damage, healing, status, items) to the DB."""
 
+import json
 import logging
 from typing import Any, Literal
 
@@ -8,6 +9,7 @@ from langgraph.graph import END
 
 from ..prompts import ACCOUNTANT_SYSTEM_PROMPT
 from ..state import GMAgentState
+from .utils import extract_entity_ids
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,33 @@ def accountant_init_node(state: GMAgentState) -> dict[str, Any]:
     if world_context:
         accountant_messages.append(SystemMessage(
             content=f"=== WORLD STATE (use these IDs for tool calls) ===\n\n{world_context}"
+        ))
+
+    # Build a unified name→id map from world_context (deterministic) and the
+    # historian-derived map (dynamic). World context is the base; historian
+    # results overlay it so any freshly-fetched IDs take precedence.
+    combined_entity_map: dict[str, str] = {}
+    if world_context:
+        try:
+            combined_entity_map.update(extract_entity_ids(json.loads(world_context)))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    historian_entity_map = state.get("entity_id_map")
+    if historian_entity_map:
+        try:
+            combined_entity_map.update(json.loads(historian_entity_map))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    if combined_entity_map:
+        accountant_messages.append(SystemMessage(
+            content=(
+                "=== ENTITY ID MAP (name → database ID) ===\n\n"
+                f"{json.dumps(combined_entity_map)}\n\n"
+                "Use these IDs when a tool parameter requires an entity ID and "
+                "the exact ID is not already present in the WORLD STATE above."
+            )
         ))
 
     if gm_response:
