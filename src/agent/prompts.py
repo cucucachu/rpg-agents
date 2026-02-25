@@ -380,6 +380,20 @@ Now create adventures!"""
 
 
 # ============================================================================
+# GM Proactive Random Event Prompts
+# ============================================================================
+
+GM_RANDOM_EVENT_CONFLICT = """[PROACTIVE EVENT — OMEN OF CONFLICT]
+Somewhere in your response this turn, weave in a subtle environmental hint that something dangerous or troubling may be approaching — independently of what the player said or did. Do not resolve the threat yet; just plant the seed. Examples: a distant rumble of thunder that feels wrong, the smell of smoke on the wind, an unnatural silence where birds should be calling, a shadow moving at the edge of vision, a horse that suddenly refuses to move. The hint should feel organic to the current setting and tone. Do not announce that a "random event" has occurred and do not break the flow of the scene."""
+
+GM_RANDOM_EVENT_PLEASANT = """[PROACTIVE EVENT — HINT OF GOOD FORTUNE]
+Somewhere in your response this turn, weave in a small unexpected detail that suggests something pleasant or lucky may be near — independently of what the player said or did. Do not resolve it yet; just let it linger. Examples: a glint of something shiny half-buried in the dirt, a stranger's warm smile and a nod of recognition, an unusually beautiful wildflower growing alone in a harsh place, a coin found on the path. Keep it subtle and proportional to the scene. Do not announce that a "random event" has occurred and do not break the flow of the scene."""
+
+GM_RANDOM_EVENT_BOON = """[PROACTIVE EVENT — HINT OF DISCOVERY]
+Somewhere in your response this turn, weave in a subtle detail that suggests a meaningful discovery or reward may be within reach — independently of what the player said or did. Do not hand it to the player yet; just make it visible. Examples: an unusual carving on a rock face, a faint trail of footprints leading off the path, a structure barely visible through the trees, a fragment of an old map sticking out of the mud. The detail should feel organic to the setting. Do not announce that a "random event" has occurred and do not break the flow of the scene."""
+
+
+# ============================================================================
 # Scribe Agent Prompt
 # ============================================================================
 
