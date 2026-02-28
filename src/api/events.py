@@ -25,6 +25,7 @@ class EventResponse(BaseModel):
     description: str = ""
     participants: str = ""
     changes: str = ""
+    mechanics: str = ""
     tags: list[str] = []
     created_at: Optional[datetime] = None
 
@@ -89,6 +90,7 @@ async def get_events(
             description=doc.get("description", ""),
             participants=doc.get("participants", ""),
             changes=doc.get("changes", ""),
+            mechanics=doc.get("mechanics", ""),
             tags=doc.get("tags", []),
             created_at=doc.get("created_at"),
         ))
@@ -160,6 +162,7 @@ async def stream_events(
                         "description": doc.get("description", ""),
                         "participants": doc.get("participants", ""),
                         "changes": doc.get("changes", ""),
+                        "mechanics": doc.get("mechanics", ""),
                         "tags": doc.get("tags", []),
                     }
                     yield f"event: event\ndata: {json.dumps(event_data)}\n\n"

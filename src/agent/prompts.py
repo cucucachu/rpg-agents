@@ -447,18 +447,21 @@ If the GM response contains multiple distinct events, call `record_event` multip
 ## Mechanics Recording
 
 If a `=== MECHANICS THIS TURN ===` block appears in your context, the GM made
-dice rolls this turn. For each event that involved a roll, include the mechanical
-outcome inline in the event `description`:
-  [Roll: 1d20+3 = 6 (Perception check — cursory survey)]
+dice rolls this turn. For each event that involved a roll, populate the `mechanics`
+field (not the `description`) with the roll outcomes:
+  "Perception check: 1d20+3 = 6"
 
-Attach each roll to the event it most directly influenced. If a roll's purpose
-does not match a specific event, append it to the most relevant event's description.
+- List each relevant roll on its own line if multiple rolls apply to a single event.
+- Attach each roll to the event it most directly influenced. If a roll's purpose
+  does not match a specific event, append it to the most relevant event's mechanics field.
+- Keep `description` as pure narrative — no roll notation in descriptions.
 
 ## Event Format
 - `name`: Short title ("Tavern Arrival", "Combat: Goblin Attack")
-- `description`: What happened (1-2 sentences)
+- `description`: What happened (1-2 sentences, narrative only — no roll notation)
 - `game_time`: Estimated time in seconds (current time + duration of this event)
 - `participants`: Who was involved (comma-separated)
+- `mechanics`: Dice rolls and outcomes (only if rolls occurred, e.g. "Perception check: 1d20+3 = 6")
 - `tags`: Categories like ["exploration"], ["combat", "victory"], ["social", "npc"]
 
 ## Chronicle Format (only when 15+ events exist)
